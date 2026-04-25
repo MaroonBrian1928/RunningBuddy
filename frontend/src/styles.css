@@ -13,7 +13,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -112,10 +113,16 @@ h2 {
   gap: 0.35rem;
 }
 
-input {
+input,
+textarea {
   border: 1px solid #bdc9c4;
   border-radius: 6px;
   padding: 0.55rem 0.65rem;
+}
+
+textarea {
+  min-height: 7rem;
+  resize: vertical;
 }
 
 .metrics {
@@ -189,6 +196,32 @@ input {
   padding: 1rem;
 }
 
+.trainingPlan {
+  display: grid;
+  gap: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.planGrid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(0, 1fr) minmax(160px, 0.35fr);
+}
+
+.trainingPlan label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.trainingPlan label span {
+  align-items: center;
+  color: #63706b;
+  display: flex;
+  font-size: 0.9rem;
+  font-weight: 700;
+  gap: 0.4rem;
+}
+
 .layout {
   display: grid;
   gap: 1rem;
@@ -224,6 +257,7 @@ input {
   display: grid;
   gap: 0.75rem;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 1rem 0 0;
 }
 
 .details div {
@@ -241,10 +275,76 @@ dd {
   font-weight: 700;
 }
 
+.detailPanel {
+  align-content: start;
+}
+
+.activityAdvice {
+  border-top: 1px solid #edf1ee;
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+}
+
+.activityAdvice h3 {
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.activityMap {
+  border: 1px solid #dce3df;
+  border-radius: 8px;
+  height: 260px;
+  margin-top: 1rem;
+  overflow: hidden;
+  position: relative;
+}
+
+.activityMap .maplibregl-map,
+.activityMap .maplibregl-canvas {
+  height: 100%;
+  width: 100%;
+}
+
+.mapEmpty {
+  border-top: 1px solid #edf1ee;
+  margin-top: 1rem;
+  padding-top: 1rem;
+}
+
+.mapWarning {
+  background: rgb(255 255 255 / 0.92);
+  border: 1px solid #dce3df;
+  border-radius: 6px;
+  bottom: 0.75rem;
+  color: #63706b;
+  font-size: 0.82rem;
+  left: 0.75rem;
+  margin: 0;
+  max-width: calc(100% - 1.5rem);
+  padding: 0.35rem 0.5rem;
+  position: absolute;
+}
+
 .advice {
   display: grid;
   gap: 0.75rem;
   margin-top: 1rem;
+}
+
+.coachNote,
+.adviceSection p {
+  margin: 0;
+}
+
+.coachNote {
+  font-weight: 700;
+}
+
+.adviceSection {
+  display: grid;
+  gap: 0.35rem;
 }
 
 .advice ul {
@@ -265,7 +365,8 @@ dd {
   }
 
   .metrics,
-  .layout {
+  .layout,
+  .planGrid {
     grid-template-columns: 1fr;
   }
 

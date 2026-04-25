@@ -23,10 +23,20 @@ pub struct LoginRequest {
     password: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateTrainingPlanRequest {
+    training_plan: Option<String>,
+    training_goals: Option<String>,
+    plan_start_date: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     authenticated: bool,
     username: Option<String>,
+    training_plan: Option<String>,
+    training_goals: Option<String>,
+    plan_start_date: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -34,6 +44,9 @@ struct UserRow {
     id: i64,
     username: String,
     password_hash: String,
+    training_plan: Option<String>,
+    training_goals: Option<String>,
+    plan_start_date: Option<String>,
 }
 
 pub async fn ensure_admin_user(pool: &SqlitePool, config: &Config) -> anyhow::Result<()> {
@@ -60,7 +73,7 @@ pub async fn login(
     Json(payload): Json<LoginRequest>,
 ) -> Result<impl IntoResponse> {
     let user = sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, password_hash FROM app_users WHERE username = ?",
+        "SELECT id, username, password_hash, training_plan, training_goals, plan_start_date FROM app_users WHERE username = ?",
     )
     .bind(&payload.username)
     .fetch_optional(&state.db)
@@ -97,6 +110,9 @@ pub async fn login(
         Json(MeResponse {
             authenticated: true,
             username: Some(user.username),
+            training_plan: user.training_plan,
+            training_goals: user.training_goals,
+            plan_start_date: user.plan_start_date,
         }),
     ))
 }
@@ -129,8 +145,36 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
     let user = current_user(&state, &headers).await.ok();
     Ok(Json(MeResponse {
         authenticated: user.is_some(),
-        username: user.map(|user| user.username),
+        username: user.as_ref().map(|user| user.username.clone()),
+        training_plan: user.as_ref().and_then(|user| user.training_plan.clone()),
+        training_goals: user.as_ref().and_then(|user| user.training_goals.clone()),
+        plan_start_date: user.as_ref().and_then(|user| user.plan_start_date.clone()),
     }))
+}
+
+pub async fn update_training_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateTrainingPlanRequest>,
+) -> Result<impl IntoResponse> {
+    let user = require_user(&state, &headers).await?;
+    sqlx::query(
+        "UPDATE app_users SET training_plan = ?, training_goals = ?, plan_start_date = ? WHERE id = ?",
+    )
+        .bind(clean_optional(payload.training_plan))
+        .bind(clean_optional(payload.training_goals))
+        .bind(clean_optional(payload.plan_start_date))
+        .bind(user.id)
+        .execute(&state.db)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
 }
 
 pub async fn require_user(state: &AppState, headers: &HeaderMap) -> Result<UserIdentity> {
@@ -142,7 +186,7 @@ async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<UserIdent
         .ok_or(AppError::Unauthorized)?;
     let user = sqlx::query_as::<_, UserIdentity>(
         r#"
-        SELECT u.id, u.username
+        SELECT u.id, u.username, u.training_plan, u.training_goals, u.plan_start_date
         FROM app_sessions s
         JOIN app_users u ON u.id = s.user_id
         WHERE s.id = ? AND s.expires_at > datetime('now')
@@ -182,4 +226,7 @@ fn verify_password(password: &str, password_hash: &str) -> Result<()> {
 pub struct UserIdentity {
     pub id: i64,
     pub username: String,
+    pub training_plan: Option<String>,
+    pub training_goals: Option<String>,
+    pub plan_start_date: Option<String>,
 }

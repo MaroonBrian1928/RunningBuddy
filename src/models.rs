@@ -55,6 +55,7 @@ pub struct TrainingAdviceBody {
 #[derive(Debug, Serialize, FromRow)]
 pub struct TrainingAdviceRow {
     pub id: i64,
+    pub activity_id: Option<i64>,
     pub provider: String,
     pub model: String,
     pub input_window_days: i64,
@@ -72,6 +73,7 @@ pub struct TrainingAdviceRow {
 #[derive(Debug, Serialize)]
 pub struct TrainingAdviceResponse {
     pub id: i64,
+    pub activity_id: Option<i64>,
     pub provider: String,
     pub model: String,
     pub input_window_days: i64,
@@ -83,6 +85,7 @@ impl TrainingAdviceRow {
     pub fn into_response(self) -> TrainingAdviceResponse {
         TrainingAdviceResponse {
             id: self.id,
+            activity_id: self.activity_id,
             provider: self.provider,
             model: self.model,
             input_window_days: self.input_window_days,

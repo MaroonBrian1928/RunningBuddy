@@ -14,11 +14,13 @@
     "@vitejs/plugin-react": "^4.4.1",
     "date-fns": "^4.1.0",
     "lucide-react": "^0.503.0",
-    "recharts": "^2.15.3",
-    "vite": "^6.3.3",
-    "typescript": "^5.8.3",
+    "maplibre-gl": "^5.24.0",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "react-map-gl": "^8.1.1",
+    "recharts": "^2.15.3",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.3"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.6.3",

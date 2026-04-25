@@ -1,4 +1,14 @@
 import "@testing-library/jest-dom/vitest";
+import React from "react";
+import { vi } from "vitest";
+
+vi.mock("react-map-gl/maplibre", () => ({
+  default: ({ children, "aria-label": ariaLabel }: { children?: React.ReactNode; "aria-label"?: string }) =>
+    React.createElement("div", { "aria-label": ariaLabel, "data-testid": "activity-map" }, children),
+  Layer: () => null,
+  Source: ({ children }: { children?: React.ReactNode }) =>
+    React.createElement(React.Fragment, null, children)
+}));
 
 class ResizeObserverMock {
   observe() {}

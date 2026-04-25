@@ -9,23 +9,20 @@ use axum::{
     http::HeaderMap,
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 #[derive(Debug, Deserialize)]
 pub struct GenerateAdviceRequest {
     #[serde(default = "default_window")]
     input_window_days: i64,
+    activity_id: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
-struct AdvicePromptActivity {
-    name: String,
-    sport_type: Option<String>,
-    start_date: Option<String>,
-    moving_time_seconds: Option<i64>,
-    distance_meters: Option<f64>,
-    average_heartrate: Option<f64>,
+struct TrainingProfile<'a> {
+    plan: Option<&'a str>,
+    goals: Option<&'a str>,
+    plan_start_date: Option<&'a str>,
 }
 
 pub async fn generate(
@@ -33,10 +30,32 @@ pub async fn generate(
     headers: HeaderMap,
     Json(payload): Json<GenerateAdviceRequest>,
 ) -> Result<Json<TrainingAdviceResponse>> {
-    auth::require_user(&state, &headers).await?;
+    let user = auth::require_user(&state, &headers).await?;
     let activities = recent_activities(&state, payload.input_window_days).await?;
-    let body = request_advice(&state, payload.input_window_days, &activities).await?;
-    let response = persist_advice(&state, payload.input_window_days, &body).await?;
+    let target_activity = match payload.activity_id {
+        Some(activity_id) => Some(activity(&state, activity_id).await?),
+        None => None,
+    };
+    let profile = TrainingProfile {
+        plan: user.training_plan.as_deref(),
+        goals: user.training_goals.as_deref(),
+        plan_start_date: user.plan_start_date.as_deref(),
+    };
+    let body = request_advice(
+        &state,
+        payload.input_window_days,
+        &activities,
+        target_activity.as_ref(),
+        &profile,
+    )
+    .await?;
+    let response = persist_advice(
+        &state,
+        payload.input_window_days,
+        payload.activity_id,
+        &body,
+    )
+    .await?;
     Ok(Json(response))
 }
 
@@ -71,23 +90,14 @@ pub async fn detail(
     Ok(Json(row.into_response()))
 }
 
-async fn recent_activities(state: &AppState, days: i64) -> Result<Vec<AdvicePromptActivity>> {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<f64>,
-            Option<f64>,
-        ),
-    >(
+async fn recent_activities(state: &AppState, days: i64) -> Result<Vec<serde_json::Value>> {
+    let rows = sqlx::query_as::<_, (String,)>(
         r#"
-        SELECT name, sport_type, start_date, moving_time_seconds, distance_meters, average_heartrate
+        SELECT raw_activity_json
         FROM activities
         WHERE deleted_at IS NULL
           AND private_unavailable = 0
+          AND sport_type = 'Run'
           AND (start_date IS NULL OR start_date >= datetime('now', ?))
         ORDER BY start_date DESC
         LIMIT 100
@@ -97,57 +107,122 @@ async fn recent_activities(state: &AppState, days: i64) -> Result<Vec<AdviceProm
     .fetch_all(&state.db)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| AdvicePromptActivity {
-            name: row.0,
-            sport_type: row.1,
-            start_date: row.2,
-            moving_time_seconds: row.3,
-            distance_meters: row.4,
-            average_heartrate: row.5,
-        })
-        .collect())
+    let mut activities = Vec::new();
+    for row in rows {
+        if let Ok(json) = serde_json::from_str(&row.0) {
+            activities.push(json);
+        }
+    }
+    Ok(activities)
+}
+
+async fn activity(state: &AppState, activity_id: i64) -> Result<serde_json::Value> {
+    let row = sqlx::query_as::<_, (String,)>(
+        r#"
+        SELECT raw_activity_json
+        FROM activities
+        WHERE id = ?
+          AND deleted_at IS NULL
+          AND private_unavailable = 0
+        "#,
+    )
+    .bind(activity_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    serde_json::from_str(&row.0).map_err(|err| AppError::BadRequest(err.to_string()))
 }
 
 async fn request_advice(
     state: &AppState,
     input_window_days: i64,
-    activities: &[AdvicePromptActivity],
+    activities: &[serde_json::Value],
+    target_activity: Option<&serde_json::Value>,
+    profile: &TrainingProfile<'_>,
 ) -> Result<TrainingAdviceBody> {
     if activities.is_empty() {
-        return Ok(local_fallback_advice(input_window_days));
+        tracing::info!("no activities available, using local fallback advice");
+        return Ok(local_fallback_advice(
+            input_window_days,
+            target_activity.is_some(),
+        ));
     }
+
+    tracing::info!(
+        provider = state.config.llm_provider,
+        model = state.config.llm_model,
+        activities_count = activities.len(),
+        has_target_activity = target_activity.is_some(),
+        has_training_plan = profile.plan.is_some(),
+        has_training_goals = profile.goals.is_some(),
+        "requesting training advice"
+    );
 
     match state.config.llm_provider.as_str() {
         "openai" if state.config.openai_api_key.is_some() => {
-            openai_advice(state, input_window_days, activities).await
+            openai_advice(
+                state,
+                input_window_days,
+                activities,
+                target_activity,
+                profile,
+            )
+            .await
         }
         "gemini" if state.config.gemini_api_key.is_some() => {
-            gemini_advice(state, input_window_days, activities).await
+            gemini_advice(
+                state,
+                input_window_days,
+                activities,
+                target_activity,
+                profile,
+            )
+            .await
         }
-        _ => Ok(local_fallback_advice(input_window_days)),
+        provider => {
+            tracing::warn!(
+                provider = provider,
+                "unknown or unconfigured LLM provider, using local fallback advice"
+            );
+            Ok(local_fallback_advice(
+                input_window_days,
+                target_activity.is_some(),
+            ))
+        }
     }
 }
 
 async fn openai_advice(
     state: &AppState,
     input_window_days: i64,
-    activities: &[AdvicePromptActivity],
+    activities: &[serde_json::Value],
+    target_activity: Option<&serde_json::Value>,
+    profile: &TrainingProfile<'_>,
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.openai_api_key.as_ref().unwrap();
+    let mut user_content = json!({
+        "input_window_days": input_window_days,
+        "activities": activities,
+        "training_profile": {
+            "plan": profile.plan,
+            "goals": profile.goals,
+            "plan_start_date": profile.plan_start_date,
+        },
+    });
+    if let Some(activity) = target_activity {
+        user_content["target_activity"] = activity.clone();
+    }
+
     let payload = json!({
         "model": state.config.llm_model,
         "response_format": { "type": "json_object" },
         "messages": [
             { "role": "system", "content": advice_system_prompt() },
-            { "role": "user", "content": json!({
-                "input_window_days": input_window_days,
-                "activities": activities,
-            }).to_string() }
+            { "role": "user", "content": user_content.to_string() }
         ]
     });
-    let response = state
+    let response_result = state
         .http
         .post(format!(
             "{}/chat/completions",
@@ -156,13 +231,36 @@ async fn openai_advice(
         .bearer_auth(api_key)
         .json(&payload)
         .send()
-        .await?
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?;
-    let content = response["choices"][0]["message"]["content"]
+        .await;
+
+    let response = match response_result {
+        Ok(res) => res,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to send request to OpenAI API");
+            return Err(err.into());
+        }
+    };
+
+    let response = match response.error_for_status() {
+        Ok(res) => res,
+        Err(err) => {
+            tracing::error!(error = %err, "OpenAI API returned an error status");
+            return Err(err.into());
+        }
+    };
+
+    let response_json: serde_json::Value = match response.json().await {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to parse OpenAI response as JSON");
+            return Err(err.into());
+        }
+    };
+
+    let content = response_json["choices"][0]["message"]["content"]
         .as_str()
         .ok_or_else(|| {
+            tracing::error!("OpenAI response did not include JSON content");
             AppError::BadRequest("OpenAI response did not include JSON content".into())
         })?;
     parse_advice_body(content)
@@ -171,21 +269,33 @@ async fn openai_advice(
 async fn gemini_advice(
     state: &AppState,
     input_window_days: i64,
-    activities: &[AdvicePromptActivity],
+    activities: &[serde_json::Value],
+    target_activity: Option<&serde_json::Value>,
+    profile: &TrainingProfile<'_>,
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.gemini_api_key.as_ref().unwrap();
+    let mut user_content = json!({
+        "input_window_days": input_window_days,
+        "activities": activities,
+        "training_profile": {
+            "plan": profile.plan,
+            "goals": profile.goals,
+            "plan_start_date": profile.plan_start_date,
+        },
+    });
+    if let Some(activity) = target_activity {
+        user_content["target_activity"] = activity.clone();
+    }
+
     let payload = json!({
         "contents": [{
-            "parts": [{ "text": format!("{}\n\n{}", advice_system_prompt(), json!({
-                "input_window_days": input_window_days,
-                "activities": activities,
-            })) }]
+            "parts": [{ "text": format!("{}\n\n{}", advice_system_prompt(), user_content) }]
         }],
         "generationConfig": {
             "responseMimeType": "application/json"
         }
     });
-    let response = state
+    let response_result = state
         .http
         .post(format!(
             "{}/models/{}:generateContent?key={}",
@@ -195,37 +305,68 @@ async fn gemini_advice(
         ))
         .json(&payload)
         .send()
-        .await?
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?;
-    let content = response["candidates"][0]["content"]["parts"][0]["text"]
+        .await;
+
+    let response = match response_result {
+        Ok(res) => res,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to send request to Gemini API");
+            return Err(err.into());
+        }
+    };
+
+    let response = match response.error_for_status() {
+        Ok(res) => res,
+        Err(err) => {
+            tracing::error!(error = %err, "Gemini API returned an error status");
+            return Err(err.into());
+        }
+    };
+
+    let response_json: serde_json::Value = match response.json().await {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to parse Gemini response as JSON");
+            return Err(err.into());
+        }
+    };
+
+    let content = response_json["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .ok_or_else(|| {
+            tracing::error!("Gemini response did not include JSON content");
             AppError::BadRequest("Gemini response did not include JSON content".into())
         })?;
     parse_advice_body(content)
 }
 
 fn parse_advice_body(content: &str) -> Result<TrainingAdviceBody> {
-    serde_json::from_str(content).map_err(|err| AppError::BadRequest(err.to_string()))
+    let clean_content = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    serde_json::from_str(clean_content).map_err(|err| AppError::BadRequest(err.to_string()))
 }
 
 async fn persist_advice(
     state: &AppState,
     input_window_days: i64,
+    activity_id: Option<i64>,
     body: &TrainingAdviceBody,
 ) -> Result<TrainingAdviceResponse> {
     let row = sqlx::query_as::<_, TrainingAdviceRow>(
         r#"
         INSERT INTO training_advice
-            (provider, model, input_window_days, summary, load_observations_json,
+            (activity_id, provider, model, input_window_days, summary, load_observations_json,
              risks_json, next_7_days_json, recovery_notes, confidence, safety_note,
              raw_response_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
         "#,
     )
+    .bind(activity_id)
     .bind(&state.config.llm_provider)
     .bind(&state.config.llm_model)
     .bind(input_window_days)
@@ -242,10 +383,16 @@ async fn persist_advice(
     Ok(row.into_response())
 }
 
-fn local_fallback_advice(input_window_days: i64) -> TrainingAdviceBody {
+fn local_fallback_advice(input_window_days: i64, has_target_activity: bool) -> TrainingAdviceBody {
+    let scope = if has_target_activity {
+        "the selected activity"
+    } else {
+        "recent training"
+    };
+
     TrainingAdviceBody {
         summary: format!(
-            "No configured LLM response is available for the last {input_window_days} days yet."
+            "No configured LLM response is available for {scope} across the last {input_window_days} days yet."
         ),
         load_observations: vec![
             "Connect Strava and sync activities to build a useful training load picture.".into(),
@@ -265,7 +412,43 @@ fn local_fallback_advice(input_window_days: i64) -> TrainingAdviceBody {
 }
 
 fn advice_system_prompt() -> &'static str {
-    "Return strict JSON with summary, load_observations, risks, next_7_days, recovery_notes, confidence, and safety_note. Advice must be non-medical and conservative."
+    r#"You are acting as an experienced running coach focused on practical, evidence-based training guidance.
+
+Your job is to help me successfully complete a specific running plan I provide. Your role is not to blindly repeat the plan, but to interpret it, explain it, adapt it when needed, and help me execute it consistently and safely.
+
+Your coaching style should be:
+
+* Direct, precise, and honest
+* Focused on training outcomes, recovery, injury prevention, and long-term consistency
+* Skeptical of vague assumptions and quick fixes
+* Willing to challenge poor decisions (skipping recovery, running too hard too often, unrealistic pacing, etc.)
+* Structured and specific rather than motivational fluff
+
+When responding:
+
+* First understand the full training plan, goal race/event, timeline, current fitness level, injury history, available training days, and constraints (work, family, travel, equipment, terrain, weather)
+* Help translate workouts into actionable pacing, effort, heart rate, or RPE guidance
+* Explain the purpose of each workout (easy run, tempo, intervals, long run, recovery, deload, etc.)
+* Identify if the plan is too aggressive, too conservative, or internally inconsistent
+* Suggest modifications only when justified, and explain why
+* Prioritize consistency over hero workouts
+* Consider sleep, nutrition, hydration, fueling, strength work, and recovery as part of the plan
+* Flag overtraining risk, poor progression, or likely injury traps early
+* If information is missing, ask targeted follow-up questions instead of assuming
+
+Do not:
+
+* Give generic "listen to your body" advice without specifics
+* Default to encouragement over accuracy
+* Assume every plan is well-designed
+* Recommend increasing intensity without strong justification
+
+Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number, "safety_note": string }.
+Write the JSON values in a conversational coaching voice, as if speaking directly to the runner.
+Use training_profile and target_activity when provided.
+If target_activity is provided, make the advice specific to that activity while still considering recent load.
+If the training plan, goal race, timeline, current fitness, injury history, available days, or constraints are missing, include concise targeted questions inside the relevant JSON fields instead of inventing details.
+Advice must be non-medical and conservative."#
 }
 
 fn default_window() -> i64 {

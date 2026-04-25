@@ -1,6 +1,9 @@
 export type MeResponse = {
   authenticated: boolean;
   username?: string | null;
+  training_plan?: string | null;
+  training_goals?: string | null;
+  plan_start_date?: string | null;
 };
 
 export type ActivitySummary = {
@@ -32,6 +35,7 @@ export type ActivityDetail = ActivitySummary & {
 
 export type TrainingAdvice = {
   id: number;
+  activity_id?: number | null;
   provider: string;
   model: string;
   input_window_days: number;
@@ -84,7 +88,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     return undefined as T;
   }
 
-  return response.json();
+  const text = await response.text();
+  if (!text) {
+    return undefined as T;
+  }
+
+  return JSON.parse(text);
 }
 
 export const api = {
@@ -95,15 +104,24 @@ export const api = {
       body: JSON.stringify({ username, password })
   }),
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
+  updateTrainingPlan: (payload: {
+    training_plan?: string | null;
+    training_goals?: string | null;
+    plan_start_date?: string | null;
+  }) =>
+    request<void>("/api/auth/training-plan", {
+      method: "PUT",
+      body: JSON.stringify(payload)
+    }),
   stravaConnect: () => request<{ authorization_url: string }>("/api/strava/connect"),
   stravaStatus: () => request<StravaStatus>("/api/strava/status"),
   sync: () => request<void>("/api/strava/sync", { method: "POST" }),
   activities: () => request<ActivitySummary[]>("/api/activities"),
   activity: (id: number) => request<ActivityDetail>(`/api/activities/${id}`),
   advice: () => request<TrainingAdvice[]>("/api/advice"),
-  generateAdvice: (input_window_days = 28) =>
+  generateAdvice: (input_window_days = 28, activity_id?: number | null) =>
     request<TrainingAdvice>("/api/advice", {
       method: "POST",
-      body: JSON.stringify({ input_window_days })
+      body: JSON.stringify({ input_window_days, activity_id })
     })
 };

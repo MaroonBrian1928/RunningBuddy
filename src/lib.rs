@@ -28,6 +28,10 @@ pub fn app(state: AppState) -> Router {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
+        .route(
+            "/api/auth/training-plan",
+            axum::routing::put(auth::update_training_plan),
+        )
         .route("/api/strava/connect", get(strava::connect))
         .route("/api/strava/callback", get(strava::callback))
         .route("/api/strava/status", get(strava::status))
