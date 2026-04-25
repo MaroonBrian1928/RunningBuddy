@@ -1,0 +1,12 @@
+.git
+.codex
+target
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo
+runningbuddy.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example

@@ -1,0 +1,40 @@
+[tools]
+node = "22"
+rust = "stable"
+
+[tasks.dev]
+description = "Run the Rust API and Vite app in separate terminals"
+run = "echo 'Run `mise run api:dev` and `mise run web:dev` in separate shells'"
+
+[tasks."api:dev"]
+description = "Run the Rust API"
+env = { RUST_LOG = "runningbuddy=debug,tower_http=info" }
+run = "cargo run"
+
+[tasks."api:test"]
+description = "Run backend tests"
+run = "cargo test"
+
+[tasks."api:fmt"]
+description = "Format Rust code"
+run = "cargo fmt"
+
+[tasks."web:install"]
+description = "Install frontend dependencies"
+run = "npm --prefix frontend install"
+
+[tasks."web:dev"]
+description = "Run the Vite frontend"
+run = "npm --prefix frontend run dev"
+
+[tasks."web:test"]
+description = "Run frontend tests"
+run = "npm --prefix frontend test"
+
+[tasks."web:build"]
+description = "Build the frontend"
+run = "npm --prefix frontend run build"
+
+[tasks.test]
+description = "Run backend and frontend tests"
+depends = ["api:test", "web:test"]
