@@ -25,7 +25,15 @@ import {
   YAxis
 } from "recharts";
 import { format, parseISO } from "date-fns";
-import { api, ActivityDetail, ActivitySummary, MeResponse, StravaStatus, TrainingAdvice } from "./lib/api";
+import {
+  api,
+  ActivityDetail,
+  ActivitySummary,
+  MeResponse,
+  StravaStatus,
+  TrainingAdvice,
+  type AdviceChatMessage
+} from "./lib/api";
 
 const CONFIGURED_MAP_STYLE_URL =
   import.meta.env.VITE_MAP_STYLE_URL
@@ -192,6 +200,9 @@ function Shell({ children, action }: { children: React.ReactNode; action?: React
         {action}
       </nav>
       {children}
+      <footer className="appFooter">
+        RunningBuddy provides general training guidance only. It is not medical advice, diagnosis, or injury treatment.
+      </footer>
     </div>
   );
 }
@@ -444,6 +455,7 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
     CONFIGURED_MAP_STYLE_URL ?? FALLBACK_MAP_STYLE
   );
   const [styleWarning, setStyleWarning] = useState<string | null>(null);
+  const [mapReady, setMapReady] = useState(false);
 
   if (!route) {
     return <p className="muted mapEmpty">No route map data is available for this activity.</p>;
@@ -466,10 +478,14 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
         }}
         mapStyle={mapStyle}
         attributionControl={false}
+        style={{ width: "100%", height: "100%" }}
+        onLoad={() => setMapReady(true)}
         onError={() => {
           if (mapStyle !== FALLBACK_MAP_STYLE) {
             setMapStyle(FALLBACK_MAP_STYLE);
             setStyleWarning("Map style failed to load, using the fallback basemap.");
+          } else {
+            setStyleWarning("Map tiles failed to load.");
           }
         }}
       >
@@ -495,8 +511,30 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
           />
         </Source>
       </Map>
+      {!mapReady && <RoutePreview route={route} />}
       {styleWarning && <p className="mapWarning">{styleWarning}</p>}
     </div>
+  );
+}
+
+function RoutePreview({ route }: { route: RouteGeoJson }) {
+  const points = route.geometry.coordinates;
+  const bounds = routeBounds(points);
+  const width = Math.max(bounds.maxLng - bounds.minLng, 0.0001);
+  const height = Math.max(bounds.maxLat - bounds.minLat, 0.0001);
+  const path = points
+    .map(([lng, lat], index) => {
+      const x = 24 + ((lng - bounds.minLng) / width) * 252;
+      const y = 24 + ((bounds.maxLat - lat) / height) * 172;
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
+    })
+    .join(" ");
+
+  return (
+    <svg className="routePreview" viewBox="0 0 300 220" role="img" aria-label="Route preview">
+      <path className="routePreviewGlow" d={path} />
+      <path className="routePreviewLine" d={path} />
+    </svg>
   );
 }
 
@@ -512,6 +550,33 @@ function AdvicePanel({
   onGenerateAdvice: () => void;
 }) {
   const latest = advice.find((item) => item.activity_id == null);
+  const [draft, setDraft] = useState("");
+  const [messages, setMessages] = useState<AdviceChatMessage[]>([]);
+  const chat = useMutation({
+    mutationFn: ({ id, nextMessages }: { id: number; nextMessages: AdviceChatMessage[] }) =>
+      api.chatAdvice(id, nextMessages),
+    onSuccess: (response) => {
+      setMessages((current) => [...current, { role: "assistant", content: response.message }]);
+    }
+  });
+
+  useEffect(() => {
+    setDraft("");
+    setMessages([]);
+  }, [latest?.id]);
+
+  function sendFollowUp(event: React.FormEvent) {
+    event.preventDefault();
+    const content = draft.trim();
+    if (!latest || !content || chat.isPending) {
+      return;
+    }
+
+    const nextMessages: AdviceChatMessage[] = [...messages, { role: "user", content }];
+    setDraft("");
+    setMessages(nextMessages);
+    chat.mutate({ id: latest.id, nextMessages });
+  }
 
   return (
     <section className="panel">
@@ -526,7 +591,36 @@ function AdvicePanel({
       </div>
       {generateError && isGenerating && <p className="error">{generateError.message}</p>}
       {!latest && <p className="muted">No advice generated yet.</p>}
-      {latest && <AdviceCard advice={latest} />}
+      {latest && (
+        <>
+          <AdviceCard advice={latest} />
+          <div className="coachChat">
+            <h3>Follow-up Chat</h3>
+            <div className="chatTranscript">
+              {messages.length === 0 && (
+                <p className="muted">Ask a follow-up about pacing, recovery, schedule changes, or how to adapt the advice.</p>
+              )}
+              {messages.map((message, index) => (
+                <div key={`${message.role}-${index}`} className={`chatBubble ${message.role}`}>
+                  {message.content}
+                </div>
+              ))}
+              {chat.isPending && <div className="chatBubble assistant">Thinking...</div>}
+            </div>
+            {chat.error && <p className="error">{(chat.error as Error).message}</p>}
+            <form className="chatForm" onSubmit={sendFollowUp}>
+              <input
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder="Ask a follow-up..."
+              />
+              <button type="submit" disabled={chat.isPending || draft.trim().length === 0}>
+                Send
+              </button>
+            </form>
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -561,7 +655,6 @@ function AdviceCard({ advice }: { advice: TrainingAdvice }) {
         <strong>Recovery</strong>
         <p>{advice.body.recovery_notes}</p>
       </div>
-      <small>{advice.body.safety_note}</small>
     </div>
   );
 }

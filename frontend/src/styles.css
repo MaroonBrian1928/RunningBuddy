@@ -44,6 +44,14 @@ button:disabled {
   padding: 1rem;
 }
 
+.appFooter {
+  border-top: 1px solid #dce3df;
+  color: #63706b;
+  font-size: 0.85rem;
+  margin-top: 1.5rem;
+  padding: 1rem 0 0;
+}
+
 nav,
 .topbar,
 .panelHeader,
@@ -293,6 +301,7 @@ dd {
 }
 
 .activityMap {
+  background: #e8eee9;
   border: 1px solid #dce3df;
   border-radius: 8px;
   height: 260px;
@@ -301,10 +310,41 @@ dd {
   position: relative;
 }
 
+.activityMap > div {
+  height: 100%;
+  width: 100%;
+}
+
 .activityMap .maplibregl-map,
 .activityMap .maplibregl-canvas {
   height: 100%;
   width: 100%;
+}
+
+.routePreview {
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
+  width: 100%;
+  height: 100%;
+}
+
+.routePreviewGlow,
+.routePreviewLine {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.routePreviewGlow {
+  opacity: 0.25;
+  stroke: #fc4c02;
+  stroke-width: 12;
+}
+
+.routePreviewLine {
+  stroke: #fc4c02;
+  stroke-width: 4;
 }
 
 .mapEmpty {
@@ -352,8 +392,46 @@ dd {
   padding-left: 1.2rem;
 }
 
-.advice small {
-  color: #63706b;
+.coachChat {
+  border-top: 1px solid #edf1ee;
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+}
+
+.coachChat h3 {
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.chatTranscript {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.chatBubble {
+  border-radius: 8px;
+  max-width: 78%;
+  padding: 0.65rem 0.75rem;
+}
+
+.chatBubble.user {
+  background: #006d77;
+  color: white;
+  justify-self: end;
+}
+
+.chatBubble.assistant {
+  background: #f1f5f3;
+  color: #18221f;
+  justify-self: start;
+}
+
+.chatForm {
+  display: grid;
+  gap: 0.5rem;
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 @media (max-width: 820px) {

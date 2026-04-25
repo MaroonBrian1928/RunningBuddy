@@ -47,8 +47,13 @@ export type TrainingAdvice = {
     next_7_days: string[];
     recovery_notes: string;
     confidence: number;
-    safety_note: string;
+    safety_note?: string;
   };
+};
+
+export type AdviceChatMessage = {
+  role: "user" | "assistant";
+  content: string;
 };
 
 export type StravaStatus = {
@@ -119,6 +124,11 @@ export const api = {
   activities: () => request<ActivitySummary[]>("/api/activities"),
   activity: (id: number) => request<ActivityDetail>(`/api/activities/${id}`),
   advice: () => request<TrainingAdvice[]>("/api/advice"),
+  chatAdvice: (id: number, messages: AdviceChatMessage[]) =>
+    request<{ message: string }>(`/api/advice/${id}/chat`, {
+      method: "POST",
+      body: JSON.stringify({ messages })
+    }),
   generateAdvice: (input_window_days = 28, activity_id?: number | null) =>
     request<TrainingAdvice>("/api/advice", {
       method: "POST",

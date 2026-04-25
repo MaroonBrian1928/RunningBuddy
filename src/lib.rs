@@ -43,6 +43,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/advice", post(advice::generate))
         .route("/api/advice", get(advice::list))
         .route("/api/advice/{id}", get(advice::detail))
+        .route("/api/advice/{id}/chat", post(advice::chat))
         .fallback_service(ServeDir::new("frontend/dist").append_index_html_on_directories(true))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())

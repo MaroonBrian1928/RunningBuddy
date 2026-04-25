@@ -49,6 +49,7 @@ pub struct TrainingAdviceBody {
     pub next_7_days: Vec<String>,
     pub recovery_notes: String,
     pub confidence: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub safety_note: String,
 }
 

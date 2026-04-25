@@ -78,11 +78,13 @@ describe("App", () => {
               risks: ["sharp increases"],
               next_7_days: ["Easy run"],
               recovery_notes: "Sleep well.",
-              confidence: 0.7,
-              safety_note: "Not medical advice."
+              confidence: 0.7
             }
           }
         ]);
+      }
+      if (path.endsWith("/api/advice/1/chat")) {
+        return jsonResponse({ message: "Keep it easy tomorrow." });
       }
       if (path.endsWith("/api/strava/status")) {
         return jsonResponse({
@@ -109,6 +111,14 @@ describe("App", () => {
     expect(await screen.findByText("Strava connected")).toBeInTheDocument();
     expect(await screen.findByText("Morning run")).toBeInTheDocument();
     expect(await screen.findByText("Keep the easy volume steady.")).toBeInTheDocument();
+    expect(screen.queryByText("Not medical advice.")).not.toBeInTheDocument();
+    expect(screen.getByText(/general training guidance only/i)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByPlaceholderText("Ask a follow-up..."), {
+      target: { value: "How hard should tomorrow be?" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("Keep it easy tomorrow.")).toBeInTheDocument();
   });
 
   it("normalizes plan start timestamps before saving", async () => {
@@ -230,8 +240,7 @@ describe("App", () => {
             risks: ["watch the next hard day"],
             next_7_days: ["Keep tomorrow easy"],
             recovery_notes: "Fuel and hydrate after the run.",
-            confidence: 0.8,
-            safety_note: "Not medical advice."
+            confidence: 0.8
           }
         });
       }

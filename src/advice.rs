@@ -9,7 +9,7 @@ use axum::{
     http::HeaderMap,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Debug, Deserialize)]
@@ -17,6 +17,22 @@ pub struct GenerateAdviceRequest {
     #[serde(default = "default_window")]
     input_window_days: i64,
     activity_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AdviceChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdviceChatRequest {
+    messages: Vec<AdviceChatMessage>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdviceChatResponse {
+    message: String,
 }
 
 struct TrainingProfile<'a> {
@@ -88,6 +104,23 @@ pub async fn detail(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(row.into_response()))
+}
+
+pub async fn chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(payload): Json<AdviceChatRequest>,
+) -> Result<Json<AdviceChatResponse>> {
+    auth::require_user(&state, &headers).await?;
+    let row = sqlx::query_as::<_, TrainingAdviceRow>("SELECT * FROM training_advice WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let advice = row.into_response();
+    let message = request_advice_chat(&state, &advice.body, &payload.messages).await?;
+    Ok(Json(AdviceChatResponse { message }))
 }
 
 async fn recent_activities(state: &AppState, days: i64) -> Result<Vec<serde_json::Value>> {
@@ -202,6 +235,7 @@ async fn openai_advice(
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.openai_api_key.as_ref().unwrap();
     let mut user_content = json!({
+        "advice_request_scope": advice_request_scope(target_activity),
         "input_window_days": input_window_days,
         "activities": activities,
         "training_profile": {
@@ -275,6 +309,7 @@ async fn gemini_advice(
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.gemini_api_key.as_ref().unwrap();
     let mut user_content = json!({
+        "advice_request_scope": advice_request_scope(target_activity),
         "input_window_days": input_window_days,
         "activities": activities,
         "training_profile": {
@@ -350,6 +385,120 @@ fn parse_advice_body(content: &str) -> Result<TrainingAdviceBody> {
     serde_json::from_str(clean_content).map_err(|err| AppError::BadRequest(err.to_string()))
 }
 
+async fn request_advice_chat(
+    state: &AppState,
+    advice: &TrainingAdviceBody,
+    messages: &[AdviceChatMessage],
+) -> Result<String> {
+    match state.config.llm_provider.as_str() {
+        "openai" if state.config.openai_api_key.is_some() => {
+            openai_advice_chat(state, advice, messages).await
+        }
+        "gemini" if state.config.gemini_api_key.is_some() => {
+            gemini_advice_chat(state, advice, messages).await
+        }
+        _ => Ok(local_chat_fallback(advice, messages)),
+    }
+}
+
+async fn openai_advice_chat(
+    state: &AppState,
+    advice: &TrainingAdviceBody,
+    messages: &[AdviceChatMessage],
+) -> Result<String> {
+    let api_key = state.config.openai_api_key.as_ref().unwrap();
+    let chat_messages = json!([
+        { "role": "system", "content": advice_chat_system_prompt() },
+        { "role": "user", "content": json!({
+            "saved_advice": advice_chat_context(advice),
+            "conversation": messages,
+        }).to_string() }
+    ]);
+    let payload = json!({
+        "model": state.config.llm_model,
+        "messages": chat_messages
+    });
+    let response_json: serde_json::Value = state
+        .http
+        .post(format!(
+            "{}/chat/completions",
+            state.config.openai_base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    response_json["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| AppError::BadRequest("OpenAI response did not include chat content".into()))
+}
+
+async fn gemini_advice_chat(
+    state: &AppState,
+    advice: &TrainingAdviceBody,
+    messages: &[AdviceChatMessage],
+) -> Result<String> {
+    let api_key = state.config.gemini_api_key.as_ref().unwrap();
+    let payload = json!({
+        "contents": [{
+            "parts": [{ "text": format!(
+                "{}\n\n{}",
+                advice_chat_system_prompt(),
+                json!({
+                    "saved_advice": advice_chat_context(advice),
+                    "conversation": messages,
+                })
+            ) }]
+        }]
+    });
+    let response_json: serde_json::Value = state
+        .http
+        .post(format!(
+            "{}/models/{}:generateContent?key={}",
+            state.config.gemini_base_url.trim_end_matches('/'),
+            state.config.llm_model,
+            api_key
+        ))
+        .json(&payload)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    response_json["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| AppError::BadRequest("Gemini response did not include chat content".into()))
+}
+
+fn advice_chat_context(advice: &TrainingAdviceBody) -> serde_json::Value {
+    json!({
+        "summary": advice.summary,
+        "load_observations": advice.load_observations,
+        "risks": advice.risks,
+        "next_7_days": advice.next_7_days,
+        "recovery_notes": advice.recovery_notes,
+        "confidence": advice.confidence,
+    })
+}
+
+fn local_chat_fallback(advice: &TrainingAdviceBody, messages: &[AdviceChatMessage]) -> String {
+    let question = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+        .unwrap_or("that");
+    format!(
+        "I cannot reach a configured coach model right now. Based on the saved advice, keep this anchored on: {} For your follow-up about \"{}\", stay conservative and use the next planned easy/recovery guidance until the model is configured.",
+        advice.summary, question
+    )
+}
+
 async fn persist_advice(
     state: &AppState,
     input_window_days: i64,
@@ -384,30 +533,52 @@ async fn persist_advice(
 }
 
 fn local_fallback_advice(input_window_days: i64, has_target_activity: bool) -> TrainingAdviceBody {
-    let scope = if has_target_activity {
-        "the selected activity"
+    let (summary, load_observations, next_7_days) = if has_target_activity {
+        (
+            format!(
+                "No configured LLM response is available to review the selected activity against your plan and the last {input_window_days} days of training yet."
+            ),
+            vec![
+                "Once a coach model is configured, this view should focus on what this specific activity says about execution, fatigue, pacing, and plan fit.".into(),
+            ],
+            vec![
+                "Treat the next planned workout conservatively until the app can compare this activity with your plan and recent load.".into(),
+                "If the selected effort felt unusually hard, bias the next run easier or shorter.".into(),
+            ],
+        )
     } else {
-        "recent training"
+        (
+            format!(
+                "No configured LLM response is available for recent training across the last {input_window_days} days yet."
+            ),
+            vec![
+                "Connect Strava and sync activities to build a useful training load picture.".into(),
+            ],
+            vec![
+                "Keep most running easy until recent activity history is synced.".into(),
+                "Add one rest or mobility-focused day if soreness is elevated.".into(),
+            ],
+        )
     };
 
     TrainingAdviceBody {
-        summary: format!(
-            "No configured LLM response is available for {scope} across the last {input_window_days} days yet."
-        ),
-        load_observations: vec![
-            "Connect Strava and sync activities to build a useful training load picture.".into(),
-        ],
+        summary,
+        load_observations,
         risks: vec![
             "Avoid ramping volume or intensity sharply while the app has limited history.".into(),
         ],
-        next_7_days: vec![
-            "Keep most running easy until recent activity history is synced.".into(),
-            "Add one rest or mobility-focused day if soreness is elevated.".into(),
-        ],
+        next_7_days,
         recovery_notes: "Prioritize sleep, hydration, and easy aerobic consistency.".into(),
         confidence: 0.2,
-        safety_note: "This is general training guidance, not medical advice or injury treatment."
-            .into(),
+        safety_note: String::new(),
+    }
+}
+
+fn advice_request_scope(target_activity: Option<&serde_json::Value>) -> &'static str {
+    if target_activity.is_some() {
+        "activity_review"
+    } else {
+        "training_overview"
     }
 }
 
@@ -443,12 +614,25 @@ Do not:
 * Assume every plan is well-designed
 * Recommend increasing intensity without strong justification
 
-Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number, "safety_note": string }.
+Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number }.
 Write the JSON values in a conversational coaching voice, as if speaking directly to the runner.
-Use training_profile and target_activity when provided.
-If target_activity is provided, make the advice specific to that activity while still considering recent load.
-If the training plan, goal race, timeline, current fitness, injury history, available days, or constraints are missing, include concise targeted questions inside the relevant JSON fields instead of inventing details.
-Advice must be non-medical and conservative."#
+Use advice_request_scope, training_profile, activities, and target_activity when provided.
+
+When advice_request_scope is "activity_review":
+* Make target_activity the center of the answer. The advice should read like a review of that exact run, not a general training-plan check-in.
+* Use the training plan, goals, plan start date, and recent activities only as context for judging whether this activity fit the intended plan, load progression, recovery needs, or next workout.
+* Tie every observation, risk, and next-7-day suggestion back to evidence from target_activity when possible: distance, duration, pacing/speed, heart rate, elevation, cadence, sport type, start date, relative effort, and how it compares with recent activities.
+* Avoid broad plan feedback unless it directly explains what this activity means or how the runner should adjust after it.
+* If target_activity lacks key data, say what is missing and give the narrowest useful activity-specific guidance rather than expanding into generic plan advice.
+
+When advice_request_scope is "training_overview":
+* Review the recent activity set and plan as a whole.
+* Keep the guidance focused on load, progression, risk, and the next week.
+If the training plan, goal race, timeline, current fitness, injury history, available days, or constraints are missing, include concise targeted questions inside the relevant JSON fields instead of inventing details."#
+}
+
+fn advice_chat_system_prompt() -> &'static str {
+    "You are a running coach continuing a conversation about previously generated training advice. Answer conversationally in plain text, not JSON. Be specific, concise, and practical. Use the saved_advice as the source of truth, answer the latest user follow-up, and ask one targeted question when key information is missing. Do not add repeated safety disclaimers; the app displays one shared footer disclaimer."
 }
 
 fn default_window() -> i64 {
@@ -468,8 +652,7 @@ mod tests {
                 "risks":["none obvious"],
                 "next_7_days":["easy run"],
                 "recovery_notes":"sleep",
-                "confidence":0.7,
-                "safety_note":"not medical advice"
+                "confidence":0.7
             }"#,
         )
         .unwrap();
