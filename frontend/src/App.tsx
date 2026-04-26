@@ -36,7 +36,7 @@ import {
 } from "./lib/api";
 
 const CONFIGURED_MAP_STYLE_URL =
-  import.meta.env.VITE_MAP_STYLE_URL
+  envValue(import.meta.env.VITE_MAP_STYLE_URL)
   ?? mapTilerStyleUrl(import.meta.env.VITE_MAPTILER_KEY)
   ?? stadiaStyleUrl(import.meta.env.VITE_STADIA_API_KEY);
 
@@ -430,11 +430,16 @@ function ActivityDetailPanel({
         <>
           <dl className="details">
             <div><dt>Name</dt><dd>{activity.name}</dd></div>
+            <div><dt>Sport</dt><dd>{activity.sport_type ?? "n/a"}</dd></div>
+            <div><dt>Date</dt><dd>{activity.start_date ? format(parseISO(activity.start_date), "MMM d, h:mm a") : "n/a"}</dd></div>
             <div><dt>Distance</dt><dd>{metersToMiles(activity.distance_meters)} mi</dd></div>
             <div><dt>Moving time</dt><dd>{secondsToTime(activity.moving_time_seconds)}</dd></div>
-            <div><dt>Heart rate</dt><dd>{activity.average_heartrate?.toFixed(0) ?? "n/a"} bpm</dd></div>
-            <div><dt>Elevation</dt><dd>{metersToFeet(activity.total_elevation_gain)} ft</dd></div>
-            <div><dt>Visibility</dt><dd>{activity.visibility ?? "n/a"}</dd></div>
+            <div><dt>Elapsed time</dt><dd>{secondsToTime(activity.elapsed_time_seconds)}</dd></div>
+            <div><dt>Pace</dt><dd>{pacePerMile(activity.distance_meters, activity.moving_time_seconds)}</dd></div>
+            <div><dt>Avg heart rate</dt><dd>{formatNumber(activity.average_heartrate)} bpm</dd></div>
+            <div><dt>Max heart rate</dt><dd>{formatNumber(activity.max_heartrate)} bpm</dd></div>
+            <div><dt>Cadence</dt><dd>{formatCadence(activity)}</dd></div>
+            <div><dt>Relative effort</dt><dd>{formatNumber(activity.suffer_score)}</dd></div>
           </dl>
           <ActivityMap activity={activity} />
           <div className="activityAdvice">
@@ -476,16 +481,18 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
             padding: 48
           }
         }}
+        key={typeof mapStyle === "string" ? mapStyle : "fallback-osm"}
         mapStyle={mapStyle}
         attributionControl={false}
         style={{ width: "100%", height: "100%" }}
         onLoad={() => setMapReady(true)}
         onError={() => {
           if (mapStyle !== FALLBACK_MAP_STYLE) {
+            setMapReady(false);
             setMapStyle(FALLBACK_MAP_STYLE);
             setStyleWarning("Map style failed to load, using the fallback basemap.");
           } else {
-            setStyleWarning("Map tiles failed to load.");
+            setStyleWarning("Basemap tiles failed to load. Check network access or configure VITE_MAP_STYLE_URL.");
           }
         }}
       >
@@ -663,15 +670,42 @@ function metersToMiles(value?: number | null) {
   return ((value ?? 0) / 1609.344).toFixed(1);
 }
 
-function metersToFeet(value?: number | null) {
-  return ((value ?? 0) * 3.28084).toFixed(0);
-}
-
 function secondsToTime(value?: number | null) {
   const total = value ?? 0;
   const hours = Math.floor(total / 3600);
   const minutes = Math.floor((total % 3600) / 60);
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+function pacePerMile(distanceMeters?: number | null, movingSeconds?: number | null) {
+  if (!distanceMeters || !movingSeconds) {
+    return "n/a";
+  }
+
+  const miles = distanceMeters / 1609.344;
+  if (miles <= 0) {
+    return "n/a";
+  }
+
+  const secondsPerMile = Math.round(movingSeconds / miles);
+  const minutes = Math.floor(secondsPerMile / 60);
+  const seconds = (secondsPerMile % 60).toString().padStart(2, "0");
+  return `${minutes}:${seconds} /mi`;
+}
+
+function formatNumber(value?: number | null) {
+  return value == null ? "n/a" : value.toFixed(0);
+}
+
+function formatCadence(activity: ActivityDetail) {
+  if (activity.average_cadence == null) {
+    return "n/a";
+  }
+
+  const cadence = activity.sport_type?.toLowerCase() === "run"
+    ? activity.average_cadence * 2
+    : activity.average_cadence;
+  return `${cadence.toFixed(0)} spm`;
 }
 
 function toDateInputValue(value?: string | null) {
@@ -684,11 +718,18 @@ function toDateInputValue(value?: string | null) {
 }
 
 function mapTilerStyleUrl(key?: string) {
-  return key ? `https://api.maptiler.com/maps/outdoor-v2/style.json?key=${key}` : null;
+  const value = envValue(key);
+  return value ? `https://api.maptiler.com/maps/outdoor-v2/style.json?key=${value}` : null;
 }
 
 function stadiaStyleUrl(key?: string) {
-  return key ? `https://tiles.stadiamaps.com/styles/outdoors.json?api_key=${key}` : null;
+  const value = envValue(key);
+  return value ? `https://tiles.stadiamaps.com/styles/outdoors.json?api_key=${value}` : null;
+}
+
+function envValue(value?: string) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
 }
 
 function activityRouteGeoJson(activity: ActivityDetail): RouteGeoJson | null {

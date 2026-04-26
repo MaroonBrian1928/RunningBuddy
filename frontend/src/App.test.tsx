@@ -266,6 +266,14 @@ describe("App", () => {
 
     fireEvent.click(await screen.findByText("Morning run"));
     expect(await screen.findByLabelText("Morning run route map")).toBeInTheDocument();
+    expect(screen.getByText("Pace")).toBeInTheDocument();
+    expect(screen.getByText("6:00 /mi")).toBeInTheDocument();
+    expect(screen.getByText("Max heart rate")).toBeInTheDocument();
+    expect(screen.getByText("170 bpm")).toBeInTheDocument();
+    expect(screen.getByText("Cadence")).toBeInTheDocument();
+    expect(screen.getByText("164 spm")).toBeInTheDocument();
+    expect(screen.queryByText("Elevation")).not.toBeInTheDocument();
+    expect(screen.queryByText("Visibility")).not.toBeInTheDocument();
     expect(await screen.findByText("No advice generated for this activity yet.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /get activity advice/i }));

@@ -246,6 +246,9 @@ async fn openai_advice(
     });
     if let Some(activity) = target_activity {
         user_content["target_activity"] = activity.clone();
+        user_content["response_focus"] = json!(
+            "Review target_activity only. Use the plan and recent activities only to explain this activity's execution, fit, load, recovery impact, and next-workout implications."
+        );
     }
 
     let payload = json!({
@@ -320,6 +323,9 @@ async fn gemini_advice(
     });
     if let Some(activity) = target_activity {
         user_content["target_activity"] = activity.clone();
+        user_content["response_focus"] = json!(
+            "Review target_activity only. Use the plan and recent activities only to explain this activity's execution, fit, load, recovery impact, and next-workout implications."
+        );
     }
 
     let payload = json!({
@@ -585,7 +591,11 @@ fn advice_request_scope(target_activity: Option<&serde_json::Value>) -> &'static
 fn advice_system_prompt() -> &'static str {
     r#"You are acting as an experienced running coach focused on practical, evidence-based training guidance.
 
-Your job is to help me successfully complete a specific running plan I provide. Your role is not to blindly repeat the plan, but to interpret it, explain it, adapt it when needed, and help me execute it consistently and safely.
+Your job depends on advice_request_scope.
+
+When advice_request_scope is "activity_review", your job is to review target_activity. The plan and recent activities are context only; do not review the plan by itself.
+
+When advice_request_scope is "training_overview", your job is to help me successfully complete a specific running plan I provide. Your role is not to blindly repeat the plan, but to interpret it, explain it, adapt it when needed, and help me execute it consistently and safely.
 
 Your coaching style should be:
 
@@ -595,7 +605,7 @@ Your coaching style should be:
 * Willing to challenge poor decisions (skipping recovery, running too hard too often, unrealistic pacing, etc.)
 * Structured and specific rather than motivational fluff
 
-When responding:
+When responding, apply these rules to the requested scope. In activity_review, apply them only when they help explain target_activity:
 
 * First understand the full training plan, goal race/event, timeline, current fitness level, injury history, available training days, and constraints (work, family, travel, equipment, terrain, weather)
 * Help translate workouts into actionable pacing, effort, heart rate, or RPE guidance
@@ -620,9 +630,12 @@ Use advice_request_scope, training_profile, activities, and target_activity when
 
 When advice_request_scope is "activity_review":
 * Make target_activity the center of the answer. The advice should read like a review of that exact run, not a general training-plan check-in.
-* Use the training plan, goals, plan start date, and recent activities only as context for judging whether this activity fit the intended plan, load progression, recovery needs, or next workout.
-* Tie every observation, risk, and next-7-day suggestion back to evidence from target_activity when possible: distance, duration, pacing/speed, heart rate, elevation, cadence, sport type, start date, relative effort, and how it compares with recent activities.
-* Avoid broad plan feedback unless it directly explains what this activity means or how the runner should adjust after it.
+* Every field must be either about target_activity itself or about target_activity in the context of the plan.
+* Use the training plan, goals, plan start date, and recent activities only to judge this activity's intended purpose, execution, load progression, recovery impact, and next-workout implications.
+* Tie every summary, observation, risk, recovery note, and next-7-day suggestion back to evidence from target_activity when possible: distance, duration, pacing/speed, heart rate, elevation, cadence, sport type, start date, relative effort, and how it compares with recent activities.
+* Do not include standalone feedback on whether the plan is good, bad, aggressive, conservative, incomplete, or internally inconsistent.
+* Do not discuss general training strategy unless it directly explains this activity or the adjustment needed because of this activity.
+* Do not fill missing activity details with broader plan commentary.
 * If target_activity lacks key data, say what is missing and give the narrowest useful activity-specific guidance rather than expanding into generic plan advice.
 
 When advice_request_scope is "training_overview":
