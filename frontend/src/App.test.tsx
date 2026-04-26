@@ -108,6 +108,9 @@ describe("App", () => {
 
     renderApp();
 
+    const configureButton = await screen.findByRole("button", { name: /configure athlete/i });
+    expect(screen.queryByText("Strava connected")).not.toBeInTheDocument();
+    fireEvent.click(configureButton);
     expect(await screen.findByText("Strava connected")).toBeInTheDocument();
     expect(await screen.findByText("Morning run")).toBeInTheDocument();
     expect(await screen.findByText("Keep the easy volume steady.")).toBeInTheDocument();
@@ -159,6 +162,7 @@ describe("App", () => {
 
     renderApp();
 
+    fireEvent.click(await screen.findByRole("button", { name: /configure athlete/i }));
     const startDate = await screen.findByLabelText(/start date/i);
     await waitFor(() => expect(startDate).toHaveValue("2026-04-25"));
 

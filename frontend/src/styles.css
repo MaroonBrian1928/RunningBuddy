@@ -37,6 +37,21 @@ button:disabled {
   opacity: 0.65;
 }
 
+.buttonSpinner {
+  animation: spin 0.8s linear infinite;
+  border: 2px solid rgb(255 255 255 / 0.42);
+  border-radius: 50%;
+  border-top-color: white;
+  height: 1rem;
+  width: 1rem;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .appShell {
   margin: 0 auto;
   max-width: 1180px;
@@ -53,7 +68,6 @@ button:disabled {
 }
 
 nav,
-.topbar,
 .panelHeader,
 .toolbar {
   align-items: center;
@@ -69,8 +83,15 @@ nav {
 .brand {
   align-items: center;
   display: flex;
+  font-size: 1.1rem;
   font-weight: 800;
   gap: 0.5rem;
+}
+
+.navActions {
+  align-items: center;
+  display: flex;
+  gap: 0.6rem;
 }
 
 .iconButton {
@@ -79,8 +100,17 @@ nav {
   width: 2.25rem;
 }
 
-.topbar {
-  margin: 1.5rem 0;
+.configPanel {
+  display: grid;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.configHeader {
+  align-items: center;
+  display: flex;
+  gap: 0.75rem;
+  justify-content: space-between;
 }
 
 h1,
@@ -148,7 +178,6 @@ textarea {
   display: flex;
   gap: 1rem;
   justify-content: space-between;
-  margin-bottom: 1rem;
   padding: 1rem;
 }
 
@@ -207,7 +236,6 @@ textarea {
 .trainingPlan {
   display: grid;
   gap: 0.9rem;
-  margin-bottom: 1rem;
 }
 
 .planGrid {
@@ -321,32 +349,6 @@ dd {
   width: 100%;
 }
 
-.routePreview {
-  inset: 0;
-  pointer-events: none;
-  position: absolute;
-  width: 100%;
-  height: 100%;
-}
-
-.routePreviewGlow,
-.routePreviewLine {
-  fill: none;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.routePreviewGlow {
-  opacity: 0.25;
-  stroke: #fc4c02;
-  stroke-width: 12;
-}
-
-.routePreviewLine {
-  stroke: #fc4c02;
-  stroke-width: 4;
-}
-
 .mapEmpty {
   border-top: 1px solid #edf1ee;
   margin-top: 1rem;
@@ -435,9 +437,9 @@ dd {
 }
 
 @media (max-width: 820px) {
-  .topbar,
   nav,
-  .toolbar {
+  .toolbar,
+  .configHeader {
     align-items: stretch;
     flex-direction: column;
   }

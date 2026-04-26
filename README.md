@@ -1,14 +1,16 @@
 # RunningBuddy
 
-Local-first Rust + React training dashboard for one athlete, with SQLite persistence,
-Strava OAuth/webhook sync, and configurable LLM training advice.
+Local-first Rust + Vite/React training dashboard for one athlete, with SQLite
+persistence, Strava OAuth/webhook sync, and configurable LLM training advice.
 
 ## Development
 
 Copy `.env.example` into your shell or local environment and set the secrets you
 need. The app defaults to `sqlite://runningbuddy.db` and `127.0.0.1:3000`.
 
-Use `mise` for project commands:
+Use `mise` for project commands. `mise` installs the Rust, Node, and Bun toolchain
+declared by this repo; Bun is used for frontend dependency install and Vite
+scripts.
 
 ```sh
 mise run api:dev

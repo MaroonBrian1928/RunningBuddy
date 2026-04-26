@@ -4,8 +4,6 @@ services:
       context: .
       args:
         VITE_MAP_STYLE_URL: "${VITE_MAP_STYLE_URL:-}"
-        VITE_MAPTILER_KEY: "${VITE_MAPTILER_KEY:-}"
-        VITE_STADIA_API_KEY: "${VITE_STADIA_API_KEY:-}"
     image: runningbuddy:local
     restart: unless-stopped
     ports:
@@ -30,9 +28,6 @@ services:
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       GEMINI_BASE_URL: "${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}"
-      VITE_MAP_STYLE_URL: "${VITE_MAP_STYLE_URL:-}"
-      VITE_MAPTILER_KEY: "${VITE_MAPTILER_KEY:-}"
-      VITE_STADIA_API_KEY: "${VITE_STADIA_API_KEY:-}"
     volumes:
       - runningbuddy-data:/data
 

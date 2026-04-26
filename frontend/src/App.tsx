@@ -10,6 +10,7 @@ import {
   LogOut,
   RefreshCw,
   Save,
+  Settings2,
   ShieldCheck,
   Sparkles,
   Target,
@@ -35,10 +36,7 @@ import {
   type AdviceChatMessage
 } from "./lib/api";
 
-const CONFIGURED_MAP_STYLE_URL =
-  envValue(import.meta.env.VITE_MAP_STYLE_URL)
-  ?? mapTilerStyleUrl(import.meta.env.VITE_MAPTILER_KEY)
-  ?? stadiaStyleUrl(import.meta.env.VITE_STADIA_API_KEY);
+const CONFIGURED_MAP_STYLE_URL = envValue(import.meta.env.VITE_MAP_STYLE_URL);
 
 const FALLBACK_MAP_STYLE: StyleSpecification = {
   version: 8,
@@ -59,6 +57,9 @@ const FALLBACK_MAP_STYLE: StyleSpecification = {
   ]
 };
 
+const ROUTE_MAP_PADDING = 12;
+const ROUTE_MAP_MAX_ZOOM = 13;
+
 type RouteGeoJson = {
   type: "Feature";
   properties: Record<string, never>;
@@ -71,6 +72,7 @@ type RouteGeoJson = {
 export function App() {
   const queryClient = useQueryClient();
   const [selectedActivityId, setSelectedActivityId] = useState<number | null>(null);
+  const [showAthleteConfig, setShowAthleteConfig] = useState(false);
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const activities = useQuery({
     queryKey: ["activities"],
@@ -117,21 +119,31 @@ export function App() {
   return (
     <Shell
       action={
-        <button className="iconButton" onClick={() => logout.mutate()} aria-label="Log out" title="Log out">
-          <LogOut size={18} />
-        </button>
+        <div className="navActions">
+          <button
+            type="button"
+            onClick={() => setShowAthleteConfig((current) => !current)}
+            aria-expanded={showAthleteConfig}
+          >
+            <Settings2 size={16} /> Configure Athlete
+          </button>
+          <button className="iconButton" onClick={() => logout.mutate()} aria-label="Log out" title="Log out">
+            <LogOut size={18} />
+          </button>
+        </div>
       }
     >
-      <header className="topbar">
-        <div>
-          <h1>RunningBuddy</h1>
-          <p>Signed in as {me.data.username}</p>
-        </div>
-        <StravaActions />
-      </header>
+      {showAthleteConfig && (
+        <section className="configPanel" aria-label="Athlete configuration">
+          <div className="configHeader">
+            <h2>Athlete Configuration</h2>
+            <StravaActions />
+          </div>
+          <StravaStatusPanel status={stravaStatus.data} isLoading={stravaStatus.isLoading} />
+          <TrainingPlanPanel me={me.data} />
+        </section>
+      )}
 
-      <StravaStatusPanel status={stravaStatus.data} isLoading={stravaStatus.isLoading} />
-      <TrainingPlanPanel me={me.data} />
       <DashboardSummary activities={activities.data ?? []} />
       <TrendChart activities={activities.data ?? []} />
 
@@ -421,7 +433,7 @@ function ActivityDetailPanel({
       <div className="panelHeader">
         <h2>Activity Detail</h2>
         <button onClick={onGenerateAdvice} disabled={!selectedActivityId || isGenerating}>
-          <Sparkles size={16} /> {isGenerating ? "Generating..." : "Get Activity Advice"}
+          <AdviceButtonContent isGenerating={isGenerating} label="Get Activity Advice" />
         </button>
       </div>
       {isLoading && <p className="muted">Loading activity...</p>}
@@ -460,7 +472,6 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
     CONFIGURED_MAP_STYLE_URL ?? FALLBACK_MAP_STYLE
   );
   const [styleWarning, setStyleWarning] = useState<string | null>(null);
-  const [mapReady, setMapReady] = useState(false);
 
   if (!route) {
     return <p className="muted mapEmpty">No route map data is available for this activity.</p>;
@@ -477,18 +488,16 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
             [bounds.maxLng, bounds.maxLat]
           ],
           fitBoundsOptions: {
-            maxZoom: 12,
-            padding: 48
+            maxZoom: ROUTE_MAP_MAX_ZOOM,
+            padding: ROUTE_MAP_PADDING
           }
         }}
         key={typeof mapStyle === "string" ? mapStyle : "fallback-osm"}
         mapStyle={mapStyle}
         attributionControl={false}
         style={{ width: "100%", height: "100%" }}
-        onLoad={() => setMapReady(true)}
         onError={() => {
           if (mapStyle !== FALLBACK_MAP_STYLE) {
-            setMapReady(false);
             setMapStyle(FALLBACK_MAP_STYLE);
             setStyleWarning("Map style failed to load, using the fallback basemap.");
           } else {
@@ -518,30 +527,8 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
           />
         </Source>
       </Map>
-      {!mapReady && <RoutePreview route={route} />}
       {styleWarning && <p className="mapWarning">{styleWarning}</p>}
     </div>
-  );
-}
-
-function RoutePreview({ route }: { route: RouteGeoJson }) {
-  const points = route.geometry.coordinates;
-  const bounds = routeBounds(points);
-  const width = Math.max(bounds.maxLng - bounds.minLng, 0.0001);
-  const height = Math.max(bounds.maxLat - bounds.minLat, 0.0001);
-  const path = points
-    .map(([lng, lat], index) => {
-      const x = 24 + ((lng - bounds.minLng) / width) * 252;
-      const y = 24 + ((bounds.maxLat - lat) / height) * 172;
-      return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
-    })
-    .join(" ");
-
-  return (
-    <svg className="routePreview" viewBox="0 0 300 220" role="img" aria-label="Route preview">
-      <path className="routePreviewGlow" d={path} />
-      <path className="routePreviewLine" d={path} />
-    </svg>
   );
 }
 
@@ -593,7 +580,7 @@ function AdvicePanel({
           <p className="muted">Recent training</p>
         </div>
         <button onClick={onGenerateAdvice} disabled={isGenerating}>
-          <Sparkles size={16} /> {isGenerating ? "Generating..." : "Generate"}
+          <AdviceButtonContent isGenerating={isGenerating} label="Generate" />
         </button>
       </div>
       {generateError && isGenerating && <p className="error">{generateError.message}</p>}
@@ -629,6 +616,15 @@ function AdvicePanel({
         </>
       )}
     </section>
+  );
+}
+
+function AdviceButtonContent({ isGenerating, label }: { isGenerating: boolean; label: string }) {
+  return (
+    <>
+      {isGenerating ? <span className="buttonSpinner" aria-hidden="true" /> : <Sparkles size={16} />}
+      {isGenerating ? "Generating..." : label}
+    </>
   );
 }
 
@@ -715,16 +711,6 @@ function toDateInputValue(value?: string | null) {
 
   const match = value.match(/^\d{4}-\d{2}-\d{2}/);
   return match?.[0] ?? "";
-}
-
-function mapTilerStyleUrl(key?: string) {
-  const value = envValue(key);
-  return value ? `https://api.maptiler.com/maps/outdoor-v2/style.json?key=${value}` : null;
-}
-
-function stadiaStyleUrl(key?: string) {
-  const value = envValue(key);
-  return value ? `https://tiles.stadiamaps.com/styles/outdoors.json?api_key=${value}` : null;
 }
 
 function envValue(value?: string) {

@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::FromRow;
 
 #[derive(Debug, Deserialize)]
 pub struct GenerateAdviceRequest {
@@ -41,6 +42,57 @@ struct TrainingProfile<'a> {
     plan_start_date: Option<&'a str>,
 }
 
+#[derive(Debug, FromRow)]
+struct AdviceActivityRow {
+    id: i64,
+    strava_activity_id: i64,
+    name: String,
+    sport_type: Option<String>,
+    start_date: Option<String>,
+    elapsed_time_seconds: Option<i64>,
+    moving_time_seconds: Option<i64>,
+    distance_meters: Option<f64>,
+    total_elevation_gain: Option<f64>,
+    average_heartrate: Option<f64>,
+    max_heartrate: Option<f64>,
+    average_speed: Option<f64>,
+    max_speed: Option<f64>,
+    average_cadence: Option<f64>,
+    average_watts: Option<f64>,
+    kilojoules: Option<f64>,
+    suffer_score: Option<f64>,
+    raw_activity_json: String,
+}
+
+#[derive(Debug, FromRow)]
+struct TargetActivityRow {
+    id: i64,
+    strava_activity_id: i64,
+    name: String,
+    sport_type: Option<String>,
+    start_date: Option<String>,
+    elapsed_time_seconds: Option<i64>,
+    moving_time_seconds: Option<i64>,
+    distance_meters: Option<f64>,
+    total_elevation_gain: Option<f64>,
+    average_heartrate: Option<f64>,
+    max_heartrate: Option<f64>,
+    average_speed: Option<f64>,
+    max_speed: Option<f64>,
+    average_cadence: Option<f64>,
+    average_watts: Option<f64>,
+    kilojoules: Option<f64>,
+    suffer_score: Option<f64>,
+    raw_activity_json: String,
+    time_json: Option<String>,
+    distance_json: Option<String>,
+    heartrate_json: Option<String>,
+    cadence_json: Option<String>,
+    velocity_smooth_json: Option<String>,
+    watts_json: Option<String>,
+    altitude_json: Option<String>,
+}
+
 pub async fn generate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -49,9 +101,10 @@ pub async fn generate(
     let user = auth::require_user(&state, &headers).await?;
     let activities = recent_activities(&state, payload.input_window_days).await?;
     let target_activity = match payload.activity_id {
-        Some(activity_id) => Some(activity(&state, activity_id).await?),
+        Some(activity_id) => Some(activity_context(&state, activity_id).await?),
         None => None,
     };
+    let athlete = athlete_context(&state).await?;
     let profile = TrainingProfile {
         plan: user.training_plan.as_deref(),
         goals: user.training_goals.as_deref(),
@@ -62,6 +115,7 @@ pub async fn generate(
         payload.input_window_days,
         &activities,
         target_activity.as_ref(),
+        athlete.as_ref(),
         &profile,
     )
     .await?;
@@ -124,39 +178,42 @@ pub async fn chat(
 }
 
 async fn recent_activities(state: &AppState, days: i64) -> Result<Vec<serde_json::Value>> {
-    let rows = sqlx::query_as::<_, (String,)>(
+    let rows = sqlx::query_as::<_, AdviceActivityRow>(
         r#"
-        SELECT raw_activity_json
+        SELECT id, strava_activity_id, name, sport_type, start_date,
+               elapsed_time_seconds, moving_time_seconds, distance_meters,
+               total_elevation_gain, average_heartrate, max_heartrate,
+               average_speed, max_speed, average_cadence, average_watts,
+               kilojoules, suffer_score, raw_activity_json
         FROM activities
         WHERE deleted_at IS NULL
           AND private_unavailable = 0
-          AND sport_type = 'Run'
           AND (start_date IS NULL OR start_date >= datetime('now', ?))
         ORDER BY start_date DESC
-        LIMIT 100
         "#,
     )
     .bind(format!("-{days} days"))
     .fetch_all(&state.db)
     .await?;
 
-    let mut activities = Vec::new();
-    for row in rows {
-        if let Ok(json) = serde_json::from_str(&row.0) {
-            activities.push(json);
-        }
-    }
-    Ok(activities)
+    Ok(rows.iter().map(activity_summary).collect())
 }
 
-async fn activity(state: &AppState, activity_id: i64) -> Result<serde_json::Value> {
-    let row = sqlx::query_as::<_, (String,)>(
+async fn activity_context(state: &AppState, activity_id: i64) -> Result<serde_json::Value> {
+    let row = sqlx::query_as::<_, TargetActivityRow>(
         r#"
-        SELECT raw_activity_json
-        FROM activities
-        WHERE id = ?
-          AND deleted_at IS NULL
-          AND private_unavailable = 0
+        SELECT a.id, a.strava_activity_id, a.name, a.sport_type, a.start_date,
+               a.elapsed_time_seconds, a.moving_time_seconds, a.distance_meters,
+               a.total_elevation_gain, a.average_heartrate, a.max_heartrate,
+               a.average_speed, a.max_speed, a.average_cadence, a.average_watts,
+               a.kilojoules, a.suffer_score, a.raw_activity_json,
+               s.time_json, s.distance_json, s.heartrate_json, s.cadence_json,
+               s.velocity_smooth_json, s.watts_json, s.altitude_json
+        FROM activities a
+        LEFT JOIN activity_streams s ON s.activity_id = a.id
+        WHERE a.id = ?
+          AND a.deleted_at IS NULL
+          AND a.private_unavailable = 0
         "#,
     )
     .bind(activity_id)
@@ -164,7 +221,244 @@ async fn activity(state: &AppState, activity_id: i64) -> Result<serde_json::Valu
     .await?
     .ok_or(AppError::NotFound)?;
 
-    serde_json::from_str(&row.0).map_err(|err| AppError::BadRequest(err.to_string()))
+    let raw_activity = serde_json::from_str::<serde_json::Value>(&row.raw_activity_json)
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+
+    Ok(json!({
+        "summary": target_activity_summary(&row),
+        "raw_strava_activity": raw_activity,
+        "stream_summary": stream_summary(&row),
+    }))
+}
+
+async fn athlete_context(state: &AppState) -> Result<Option<serde_json::Value>> {
+    let row = sqlx::query_as::<_, (String,)>(
+        r#"
+        SELECT a.raw_profile_json
+        FROM athletes a
+        JOIN strava_tokens t ON t.athlete_id = a.id
+        ORDER BY t.updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.db)
+    .await?;
+
+    Ok(row
+        .and_then(|row| serde_json::from_str::<serde_json::Value>(&row.0).ok())
+        .map(compact_athlete_profile))
+}
+
+fn compact_athlete_profile(profile: serde_json::Value) -> serde_json::Value {
+    json!({
+        "id": profile.get("id"),
+        "username": profile.get("username"),
+        "firstname": profile.get("firstname"),
+        "lastname": profile.get("lastname"),
+        "city": profile.get("city"),
+        "state": profile.get("state"),
+        "country": profile.get("country"),
+        "sex": profile.get("sex"),
+        "weight_kg": profile.get("weight"),
+        "ftp": profile.get("ftp"),
+        "measurement_preference": profile.get("measurement_preference"),
+        "shoes": compact_gear(profile.get("shoes")),
+        "bikes": compact_gear(profile.get("bikes")),
+    })
+}
+
+fn compact_gear(gear: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(items) = gear.and_then(|gear| gear.as_array()) else {
+        return json!([]);
+    };
+
+    json!(items
+        .iter()
+        .map(|item| {
+            let distance_meters = item.get("distance").and_then(|value| value.as_f64());
+            json!({
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "primary": item.get("primary"),
+                "resource_state": item.get("resource_state"),
+                "distance_meters": distance_meters,
+                "distance_miles": distance_meters.map(meters_to_miles),
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+fn compact_activity_gear(activity: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let activity = activity?;
+    let gear = activity.get("gear")?;
+    Some(json!({
+        "gear_id": activity.get("gear_id"),
+        "id": gear.get("id"),
+        "name": gear.get("name"),
+        "primary": gear.get("primary"),
+        "resource_state": gear.get("resource_state"),
+        "distance_meters": gear.get("distance").and_then(|value| value.as_f64()),
+        "distance_miles": gear.get("distance").and_then(|value| value.as_f64()).map(meters_to_miles),
+    }))
+}
+
+fn activity_summary(row: &AdviceActivityRow) -> serde_json::Value {
+    let raw = serde_json::from_str::<serde_json::Value>(&row.raw_activity_json).ok();
+    json!({
+        "id": row.id,
+        "strava_activity_id": row.strava_activity_id,
+        "name": row.name,
+        "sport_type": row.sport_type,
+        "start_date": row.start_date,
+        "elapsed_time_seconds": row.elapsed_time_seconds,
+        "moving_time_seconds": row.moving_time_seconds,
+        "distance_meters": row.distance_meters,
+        "distance_miles": row.distance_meters.map(meters_to_miles),
+        "pace_seconds_per_mile": pace_seconds_per_mile(row.distance_meters, row.moving_time_seconds),
+        "total_elevation_gain_meters": row.total_elevation_gain,
+        "average_heartrate": row.average_heartrate,
+        "max_heartrate": row.max_heartrate,
+        "average_speed_mps": row.average_speed,
+        "max_speed_mps": row.max_speed,
+        "average_cadence": row.average_cadence,
+        "average_run_cadence_spm": run_cadence(row.sport_type.as_deref(), row.average_cadence),
+        "average_watts": row.average_watts,
+        "kilojoules": row.kilojoules,
+        "relative_effort": row.suffer_score,
+        "perceived_exertion": raw.as_ref().and_then(|activity| activity.get("perceived_exertion")),
+        "description": raw.as_ref().and_then(|activity| activity.get("description")),
+        "workout_type": raw.as_ref().and_then(|activity| activity.get("workout_type")),
+        "gear_id": raw.as_ref().and_then(|activity| activity.get("gear_id")),
+        "gear": compact_activity_gear(raw.as_ref()),
+    })
+}
+
+fn target_activity_summary(row: &TargetActivityRow) -> serde_json::Value {
+    let raw = serde_json::from_str::<serde_json::Value>(&row.raw_activity_json).ok();
+    json!({
+        "id": row.id,
+        "strava_activity_id": row.strava_activity_id,
+        "name": row.name,
+        "sport_type": row.sport_type,
+        "start_date": row.start_date,
+        "elapsed_time_seconds": row.elapsed_time_seconds,
+        "moving_time_seconds": row.moving_time_seconds,
+        "distance_meters": row.distance_meters,
+        "distance_miles": row.distance_meters.map(meters_to_miles),
+        "pace_seconds_per_mile": pace_seconds_per_mile(row.distance_meters, row.moving_time_seconds),
+        "total_elevation_gain_meters": row.total_elevation_gain,
+        "average_heartrate": row.average_heartrate,
+        "max_heartrate": row.max_heartrate,
+        "average_speed_mps": row.average_speed,
+        "max_speed_mps": row.max_speed,
+        "average_cadence": row.average_cadence,
+        "average_run_cadence_spm": run_cadence(row.sport_type.as_deref(), row.average_cadence),
+        "average_watts": row.average_watts,
+        "kilojoules": row.kilojoules,
+        "relative_effort": row.suffer_score,
+        "perceived_exertion": raw.as_ref().and_then(|activity| activity.get("perceived_exertion")),
+        "description": raw.as_ref().and_then(|activity| activity.get("description")),
+        "workout_type": raw.as_ref().and_then(|activity| activity.get("workout_type")),
+        "gear_id": raw.as_ref().and_then(|activity| activity.get("gear_id")),
+        "gear": compact_activity_gear(raw.as_ref()),
+        "splits_metric": raw.as_ref().and_then(|activity| activity.get("splits_metric")),
+        "splits_standard": raw.as_ref().and_then(|activity| activity.get("splits_standard")),
+        "best_efforts": raw.as_ref().and_then(|activity| activity.get("best_efforts")),
+        "laps": raw.as_ref().and_then(|activity| activity.get("laps")),
+    })
+}
+
+fn stream_summary(row: &TargetActivityRow) -> serde_json::Value {
+    let time = parse_number_stream(row.time_json.as_deref());
+    let distance = parse_number_stream(row.distance_json.as_deref());
+    let heartrate = parse_number_stream(row.heartrate_json.as_deref());
+    let cadence = parse_number_stream(row.cadence_json.as_deref());
+    let velocity = parse_number_stream(row.velocity_smooth_json.as_deref());
+    let watts = parse_number_stream(row.watts_json.as_deref());
+    let altitude = parse_number_stream(row.altitude_json.as_deref());
+
+    json!({
+        "sample_count": time.len().max(distance.len()).max(heartrate.len()).max(cadence.len()).max(velocity.len()).max(watts.len()).max(altitude.len()),
+        "time_seconds": number_stats(&time),
+        "distance_meters": number_stats(&distance),
+        "heartrate_bpm": number_stats(&heartrate),
+        "cadence": number_stats(&cadence),
+        "run_cadence_spm": number_stats(&cadence.iter().map(|value| value * 2.0).collect::<Vec<_>>()),
+        "velocity_smooth_mps": number_stats(&velocity),
+        "pace_seconds_per_mile": pace_stats_from_velocity(&velocity),
+        "watts": number_stats(&watts),
+        "altitude_meters": number_stats(&altitude),
+        "duration_seconds": time.last().copied(),
+        "distance_total_meters": distance.last().copied(),
+    })
+}
+
+fn parse_number_stream(value: Option<&str>) -> Vec<f64> {
+    value
+        .and_then(|value| serde_json::from_str::<Vec<f64>>(value).ok())
+        .unwrap_or_default()
+}
+
+fn number_stats(values: &[f64]) -> serde_json::Value {
+    if values.is_empty() {
+        return serde_json::Value::Null;
+    }
+
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    let mut sum = 0.0;
+    for value in values {
+        min = min.min(*value);
+        max = max.max(*value);
+        sum += value;
+    }
+
+    json!({
+        "count": values.len(),
+        "first": values.first().copied(),
+        "last": values.last().copied(),
+        "min": min,
+        "max": max,
+        "avg": sum / values.len() as f64,
+    })
+}
+
+fn pace_stats_from_velocity(values: &[f64]) -> serde_json::Value {
+    let paces = values
+        .iter()
+        .filter(|value| **value > 0.0)
+        .map(|meters_per_second| 1609.344 / meters_per_second)
+        .collect::<Vec<_>>();
+    number_stats(&paces)
+}
+
+fn meters_to_miles(value: f64) -> f64 {
+    value / 1609.344
+}
+
+fn pace_seconds_per_mile(
+    distance_meters: Option<f64>,
+    moving_time_seconds: Option<i64>,
+) -> Option<f64> {
+    let distance_meters = distance_meters?;
+    let moving_time_seconds = moving_time_seconds?;
+    if distance_meters <= 0.0 || moving_time_seconds <= 0 {
+        return None;
+    }
+    Some(moving_time_seconds as f64 / meters_to_miles(distance_meters))
+}
+
+fn run_cadence(sport_type: Option<&str>, cadence: Option<f64>) -> Option<f64> {
+    cadence.map(|cadence| {
+        if sport_type
+            .map(|sport_type| sport_type.eq_ignore_ascii_case("run"))
+            .unwrap_or(false)
+        {
+            cadence * 2.0
+        } else {
+            cadence
+        }
+    })
 }
 
 async fn request_advice(
@@ -172,9 +466,10 @@ async fn request_advice(
     input_window_days: i64,
     activities: &[serde_json::Value],
     target_activity: Option<&serde_json::Value>,
+    athlete: Option<&serde_json::Value>,
     profile: &TrainingProfile<'_>,
 ) -> Result<TrainingAdviceBody> {
-    if activities.is_empty() {
+    if activities.is_empty() && target_activity.is_none() {
         tracing::info!("no activities available, using local fallback advice");
         return Ok(local_fallback_advice(
             input_window_days,
@@ -187,6 +482,7 @@ async fn request_advice(
         model = state.config.llm_model,
         activities_count = activities.len(),
         has_target_activity = target_activity.is_some(),
+        has_athlete_profile = athlete.is_some(),
         has_training_plan = profile.plan.is_some(),
         has_training_goals = profile.goals.is_some(),
         "requesting training advice"
@@ -199,6 +495,7 @@ async fn request_advice(
                 input_window_days,
                 activities,
                 target_activity,
+                athlete,
                 profile,
             )
             .await
@@ -209,6 +506,7 @@ async fn request_advice(
                 input_window_days,
                 activities,
                 target_activity,
+                athlete,
                 profile,
             )
             .await
@@ -231,6 +529,7 @@ async fn openai_advice(
     input_window_days: i64,
     activities: &[serde_json::Value],
     target_activity: Option<&serde_json::Value>,
+    athlete: Option<&serde_json::Value>,
     profile: &TrainingProfile<'_>,
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.openai_api_key.as_ref().unwrap();
@@ -238,6 +537,7 @@ async fn openai_advice(
         "advice_request_scope": advice_request_scope(target_activity),
         "input_window_days": input_window_days,
         "activities": activities,
+        "athlete_profile": athlete,
         "training_profile": {
             "plan": profile.plan,
             "goals": profile.goals,
@@ -308,6 +608,7 @@ async fn gemini_advice(
     input_window_days: i64,
     activities: &[serde_json::Value],
     target_activity: Option<&serde_json::Value>,
+    athlete: Option<&serde_json::Value>,
     profile: &TrainingProfile<'_>,
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.gemini_api_key.as_ref().unwrap();
@@ -315,6 +616,7 @@ async fn gemini_advice(
         "advice_request_scope": advice_request_scope(target_activity),
         "input_window_days": input_window_days,
         "activities": activities,
+        "athlete_profile": athlete,
         "training_profile": {
             "plan": profile.plan,
             "goals": profile.goals,
@@ -626,7 +928,7 @@ Do not:
 
 Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number }.
 Write the JSON values in a conversational coaching voice, as if speaking directly to the runner.
-Use advice_request_scope, training_profile, activities, and target_activity when provided.
+Use advice_request_scope, athlete_profile, training_profile, activities, and target_activity when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present. In activity_review, target_activity contains the selected activity summary, selected raw Strava detail, and compact stream summaries.
 
 When advice_request_scope is "activity_review":
 * Make target_activity the center of the answer. The advice should read like a review of that exact run, not a general training-plan check-in.
@@ -672,5 +974,33 @@ mod tests {
 
         assert_eq!(body.summary, "steady");
         assert_eq!(body.next_7_days.len(), 1);
+    }
+
+    #[test]
+    fn compact_athlete_profile_includes_gear_mileage() {
+        let profile = json!({
+            "id": 123,
+            "firstname": "Marianne",
+            "shoes": [{
+                "id": "g123",
+                "primary": true,
+                "name": "adidas",
+                "distance": 4904.0
+            }],
+            "bikes": [{
+                "id": "b123",
+                "primary": true,
+                "name": "EMC",
+                "distance": 1609.344
+            }]
+        });
+
+        let compact = compact_athlete_profile(profile);
+
+        assert_eq!(compact["shoes"][0]["name"], "adidas");
+        assert_eq!(compact["shoes"][0]["distance_meters"], 4904.0);
+        assert!((compact["shoes"][0]["distance_miles"].as_f64().unwrap() - 3.047).abs() < 0.001);
+        assert_eq!(compact["bikes"][0]["name"], "EMC");
+        assert_eq!(compact["bikes"][0]["distance_miles"], 1.0);
     }
 }

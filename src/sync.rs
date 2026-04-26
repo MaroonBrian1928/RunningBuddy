@@ -60,6 +60,7 @@ async fn sync_all_athletes(state: &AppState, backfill_days: i64) -> anyhow::Resu
     let tokens = load_token_rows(state).await?;
     for mut token in tokens {
         refresh_token_if_needed(state, &mut token).await?;
+        sync_athlete_profile(state, &token).await?;
         sync_athlete_activities(state, &token, backfill_days).await?;
     }
     Ok(())
@@ -144,6 +145,38 @@ async fn sync_activity_with_token(
     {
         upsert_streams(state, strava_activity_id, &streams).await?;
     }
+    Ok(())
+}
+
+async fn sync_athlete_profile(state: &AppState, token: &TokenRow) -> anyhow::Result<()> {
+    let athlete = strava_get_json(
+        state,
+        &token.access_token,
+        &format!("{STRAVA_API_BASE}/athlete"),
+    )
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE athletes
+        SET username = ?,
+            firstname = ?,
+            lastname = ?,
+            profile_url = ?,
+            raw_profile_json = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        "#,
+    )
+    .bind(athlete.get("username").and_then(Value::as_str))
+    .bind(athlete.get("firstname").and_then(Value::as_str))
+    .bind(athlete.get("lastname").and_then(Value::as_str))
+    .bind(athlete.get("profile").and_then(Value::as_str))
+    .bind(athlete.to_string())
+    .bind(token.athlete_id)
+    .execute(&state.db)
+    .await?;
+
     Ok(())
 }
 

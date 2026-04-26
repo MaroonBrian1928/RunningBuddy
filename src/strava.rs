@@ -190,15 +190,8 @@ pub async fn bootstrap_env_token(state: &AppState) -> anyhow::Result<bool> {
         return Ok(false);
     };
 
-    let athlete = match state
-        .http
-        .get(format!("{STRAVA_API_BASE}/athlete"))
-        .bearer_auth(access_token)
-        .send()
-        .await?
-        .error_for_status()
-    {
-        Ok(response) => response.json::<serde_json::Value>().await?,
+    let athlete = match fetch_logged_in_athlete(state, access_token).await {
+        Ok(athlete) => athlete,
         Err(err) if state.config.strava_athlete_id.is_some() => {
             tracing::warn!(
                 error = %err,
@@ -308,18 +301,29 @@ async fn exchange_code(state: &AppState, code: &str, scopes: String) -> Result<(
         .json::<serde_json::Value>()
         .await?;
 
-    let athlete = response
+    let token_athlete = response
         .get("athlete")
         .cloned()
         .ok_or_else(|| AppError::BadRequest("Strava token response missing athlete".into()))?;
+    let access_token = response
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let athlete = match fetch_logged_in_athlete(state, access_token).await {
+        Ok(athlete) => athlete,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "using Strava token athlete because /athlete fetch after OAuth failed"
+            );
+            token_athlete
+        }
+    };
 
     persist_athlete_and_token(
         state,
         athlete,
-        response
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default(),
+        access_token,
         response
             .get("refresh_token")
             .and_then(|v| v.as_str())
@@ -333,6 +337,21 @@ async fn exchange_code(state: &AppState, code: &str, scopes: String) -> Result<(
     .await?;
 
     Ok(())
+}
+
+async fn fetch_logged_in_athlete(
+    state: &AppState,
+    access_token: &str,
+) -> Result<serde_json::Value> {
+    Ok(state
+        .http
+        .get(format!("{STRAVA_API_BASE}/athlete"))
+        .bearer_auth(access_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?)
 }
 
 async fn persist_athlete_and_token(

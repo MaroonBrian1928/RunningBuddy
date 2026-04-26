@@ -1,4 +1,5 @@
 [tools]
+bun = "1"
 node = "22"
 rust = "stable"
 
@@ -21,19 +22,19 @@ run = "cargo fmt"
 
 [tasks."web:install"]
 description = "Install frontend dependencies"
-run = "npm --prefix frontend install"
+run = "bun install --cwd frontend"
 
 [tasks."web:dev"]
 description = "Run the Vite frontend"
-run = "npm --prefix frontend run dev"
+run = "bun run --cwd frontend dev"
 
 [tasks."web:test"]
 description = "Run frontend tests"
-run = "npm --prefix frontend test"
+run = "bun run --cwd frontend test"
 
 [tasks."web:build"]
 description = "Build the frontend"
-run = "npm --prefix frontend run build"
+run = "bun run --cwd frontend build"
 
 [tasks.test]
 description = "Run backend and frontend tests"

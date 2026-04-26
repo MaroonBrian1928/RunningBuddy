@@ -1,17 +1,13 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22-bookworm-slim AS frontend
+FROM oven/bun:1-debian AS frontend
 WORKDIR /app/frontend
 ARG VITE_MAP_STYLE_URL
-ARG VITE_MAPTILER_KEY
-ARG VITE_STADIA_API_KEY
-ENV VITE_MAP_STYLE_URL=${VITE_MAP_STYLE_URL} \
-    VITE_MAPTILER_KEY=${VITE_MAPTILER_KEY} \
-    VITE_STADIA_API_KEY=${VITE_STADIA_API_KEY}
-COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
+ENV VITE_MAP_STYLE_URL=${VITE_MAP_STYLE_URL}
+COPY frontend/package.json frontend/bun.lock ./
+RUN bun install --frozen-lockfile
 COPY frontend ./
-RUN npm run build
+RUN bun run build
 
 FROM rust:1-bookworm AS backend
 WORKDIR /app
