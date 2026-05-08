@@ -104,7 +104,7 @@ async fn sync_athlete_activities(
             let Some(strava_activity_id) = activity.get("id").and_then(Value::as_i64) else {
                 continue;
             };
-            sync_activity_with_token(state, token, strava_activity_id).await?;
+            sync_activity_with_token(state, token, strava_activity_id, false).await?;
         }
     }
 
@@ -120,13 +120,14 @@ async fn sync_activity_for_owner(
         .await?
         .ok_or_else(|| anyhow!("no Strava token for athlete {strava_athlete_id}"))?;
     refresh_token_if_needed(state, &mut token).await?;
-    sync_activity_with_token(state, &token, strava_activity_id).await
+    sync_activity_with_token(state, &token, strava_activity_id, true).await
 }
 
 async fn sync_activity_with_token(
     state: &AppState,
     token: &TokenRow,
     strava_activity_id: i64,
+    refresh_streams: bool,
 ) -> anyhow::Result<()> {
     let detail_url =
         format!("{STRAVA_API_BASE}/activities/{strava_activity_id}?include_all_efforts=false");
@@ -140,10 +141,12 @@ async fn sync_activity_with_token(
     };
 
     upsert_activity(state, token.athlete_id, &detail).await?;
-    if let Some(streams) =
-        fetch_activity_streams(state, &token.access_token, strava_activity_id).await?
-    {
-        upsert_streams(state, strava_activity_id, &streams).await?;
+    if refresh_streams || !activity_streams_exist(state, strava_activity_id).await? {
+        if let Some(streams) =
+            fetch_activity_streams(state, &token.access_token, strava_activity_id).await?
+        {
+            upsert_streams(state, strava_activity_id, &streams).await?;
+        }
     }
     Ok(())
 }
@@ -437,6 +440,23 @@ async fn upsert_streams(
     .execute(&state.db)
     .await?;
     Ok(())
+}
+
+async fn activity_streams_exist(state: &AppState, strava_activity_id: i64) -> anyhow::Result<bool> {
+    let exists: (i64,) = sqlx::query_as(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM activity_streams s
+            JOIN activities a ON a.id = s.activity_id
+            WHERE a.strava_activity_id = ?
+        )
+        "#,
+    )
+    .bind(strava_activity_id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(exists.0 != 0)
 }
 
 fn stream_data(streams: &Value, key: &str) -> Option<String> {

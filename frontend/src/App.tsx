@@ -73,6 +73,7 @@ export function App() {
   const queryClient = useQueryClient();
   const [selectedActivityId, setSelectedActivityId] = useState<number | null>(null);
   const [showAthleteConfig, setShowAthleteConfig] = useState(false);
+  const [isWatchingSync, setIsWatchingSync] = useState(false);
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const activities = useQuery({
     queryKey: ["activities"],
@@ -87,7 +88,11 @@ export function App() {
   const stravaStatus = useQuery({
     queryKey: ["stravaStatus"],
     queryFn: api.stravaStatus,
-    enabled: me.data?.authenticated === true
+    enabled: me.data?.authenticated === true,
+    refetchInterval: (query) => {
+      const status = query.state.data as StravaStatus | undefined;
+      return isWatchingSync || hasActiveSync(status) ? 2000 : false;
+    }
   });
   const selectedActivity = useQuery({
     queryKey: ["activity", selectedActivityId],
@@ -107,6 +112,16 @@ export function App() {
     mutationFn: api.logout,
     onSuccess: () => queryClient.invalidateQueries()
   });
+
+  useEffect(() => {
+    if (!isWatchingSync || !stravaStatus.data || hasActiveSync(stravaStatus.data)) {
+      return;
+    }
+
+    setIsWatchingSync(false);
+    queryClient.invalidateQueries({ queryKey: ["activities"] });
+    queryClient.invalidateQueries({ queryKey: ["advice"] });
+  }, [isWatchingSync, queryClient, stravaStatus.data]);
 
   if (me.isLoading) {
     return <Shell><p className="muted">Loading session...</p></Shell>;
@@ -137,9 +152,13 @@ export function App() {
         <section className="configPanel" aria-label="Athlete configuration">
           <div className="configHeader">
             <h2>Athlete Configuration</h2>
-            <StravaActions />
+            <StravaActions onSyncQueued={() => setIsWatchingSync(true)} />
           </div>
-          <StravaStatusPanel status={stravaStatus.data} isLoading={stravaStatus.isLoading} />
+          <StravaStatusPanel
+            status={stravaStatus.data}
+            isLoading={stravaStatus.isLoading}
+            isLive={isWatchingSync || hasActiveSync(stravaStatus.data)}
+          />
           <TrainingPlanPanel me={me.data} />
         </section>
       )}
@@ -219,7 +238,7 @@ function Shell({ children, action }: { children: React.ReactNode; action?: React
   );
 }
 
-function StravaActions() {
+function StravaActions({ onSyncQueued }: { onSyncQueued: () => void }) {
   const queryClient = useQueryClient();
   const connect = useMutation({
     mutationFn: api.stravaConnect,
@@ -229,7 +248,10 @@ function StravaActions() {
   });
   const sync = useMutation({
     mutationFn: api.sync,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["stravaStatus"] })
+    onSuccess: () => {
+      onSyncQueued();
+      queryClient.invalidateQueries({ queryKey: ["stravaStatus"] });
+    }
   });
 
   return (
@@ -244,9 +266,25 @@ function StravaActions() {
   );
 }
 
-function StravaStatusPanel({ status, isLoading }: { status?: StravaStatus; isLoading: boolean }) {
+function StravaStatusPanel({
+  status,
+  isLoading,
+  isLive
+}: {
+  status?: StravaStatus;
+  isLoading: boolean;
+  isLive: boolean;
+}) {
   const athleteName = [status?.athlete?.firstname, status?.athlete?.lastname].filter(Boolean).join(" ");
   const isConnected = status?.connected === true;
+  const activeSyncCount = (status?.queued_jobs ?? 0) + (status?.running_jobs ?? 0);
+  const syncLabel = activeSyncCount > 0
+    ? `${activeSyncCount} sync ${activeSyncCount === 1 ? "job" : "jobs"} active`
+    : isLive
+      ? "Watching sync"
+      : status?.last_completed_sync_at
+        ? `Last sync ${format(parseISO(status.last_completed_sync_at), "MMM d, h:mm a")}`
+        : "No completed sync yet";
 
   return (
     <section className="statusBand">
@@ -260,10 +298,18 @@ function StravaStatusPanel({ status, isLoading }: { status?: StravaStatus; isLoa
       <div className="statusMeta">
         <span>{status?.configured ? "OAuth configured" : "OAuth missing"}</span>
         <span>{status?.scopes?.length ? status.scopes.join(", ") : "No scopes yet"}</span>
+        <span className={isLive ? "liveSyncStatus" : undefined}>
+          {isLive && <RefreshCw size={14} />}
+          {syncLabel}
+        </span>
         <span>{status ? `${status.queued_jobs} queued / ${status.running_jobs} running / ${status.failed_jobs} failed` : "Queue unavailable"}</span>
       </div>
     </section>
   );
+}
+
+function hasActiveSync(status?: StravaStatus) {
+  return Boolean(status && (status.queued_jobs > 0 || status.running_jobs > 0));
 }
 
 function TrainingPlanPanel({ me }: { me: MeResponse }) {
@@ -544,6 +590,7 @@ function AdvicePanel({
   onGenerateAdvice: () => void;
 }) {
   const latest = advice.find((item) => item.activity_id == null);
+  const currentDateLabel = format(new Date(), "MMM d, yyyy");
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<AdviceChatMessage[]>([]);
   const chat = useMutation({
@@ -576,8 +623,8 @@ function AdvicePanel({
     <section className="panel">
       <div className="panelHeader">
         <div>
-          <h2>Training Advice</h2>
-          <p className="muted">Recent training</p>
+          <h2>Training Overview</h2>
+          <p className="muted">{currentDateLabel}</p>
         </div>
         <button onClick={onGenerateAdvice} disabled={isGenerating}>
           <AdviceButtonContent isGenerating={isGenerating} label="Generate" />

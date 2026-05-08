@@ -205,6 +205,18 @@ textarea {
   text-align: right;
 }
 
+.liveSyncStatus {
+  align-items: center;
+  color: #006d77;
+  display: inline-flex;
+  gap: 0.35rem;
+  justify-content: flex-end;
+}
+
+.liveSyncStatus svg {
+  animation: spin 0.9s linear infinite;
+}
+
 .metric,
 .panel {
   background: white;
@@ -457,6 +469,10 @@ dd {
 
   .statusMeta {
     text-align: left;
+  }
+
+  .liveSyncStatus {
+    justify-content: flex-start;
   }
 
   .row {

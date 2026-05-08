@@ -3,6 +3,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 
+const queryClients: QueryClient[] = [];
+
 function renderApp() {
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -10,6 +12,7 @@ function renderApp() {
       mutations: { retry: false }
     }
   });
+  queryClients.push(queryClient);
 
   render(
     <QueryClientProvider client={queryClient}>
@@ -29,8 +32,9 @@ function jsonResponse(body: unknown) {
 
 describe("App", () => {
   afterEach(() => {
-    vi.restoreAllMocks();
     cleanup();
+    queryClients.splice(0).forEach((queryClient) => queryClient.clear());
+    vi.restoreAllMocks();
   });
 
   it("renders login when unauthenticated", async () => {
@@ -176,6 +180,52 @@ describe("App", () => {
         })
       );
     });
+  });
+
+  it("keeps Strava sync status live after queuing a manual sync", async () => {
+    let statusCalls = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const path = input.toString();
+      if (path.endsWith("/api/auth/me")) {
+        return jsonResponse({ authenticated: true, username: "admin" });
+      }
+      if (path.endsWith("/api/activities")) {
+        return jsonResponse([]);
+      }
+      if (path.endsWith("/api/advice")) {
+        return jsonResponse([]);
+      }
+      if (path.endsWith("/api/strava/status")) {
+        statusCalls += 1;
+        return jsonResponse({
+          configured: true,
+          connected: true,
+          athlete: null,
+          scopes: ["read", "activity:read"],
+          queued_jobs: statusCalls > 1 ? 1 : 0,
+          running_jobs: 0,
+          failed_jobs: 0,
+          last_completed_sync_at: null
+        });
+      }
+      if (path.endsWith("/api/strava/sync") && init?.method === "POST") {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      return Promise.reject(new Error(`unexpected request: ${path}`));
+    });
+
+    renderApp();
+
+    fireEvent.click(await screen.findByRole("button", { name: /configure athlete/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /^sync$/i }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/strava/sync",
+        expect.objectContaining({ method: "POST" })
+      );
+    });
+    expect(await screen.findByText("1 sync job active")).toBeInTheDocument();
   });
 
   it("generates and shows activity-specific advice in the activity detail panel", async () => {

@@ -9,6 +9,7 @@ use axum::{
     http::HeaderMap,
     Json,
 };
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::FromRow;
@@ -533,8 +534,11 @@ async fn openai_advice(
     profile: &TrainingProfile<'_>,
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.openai_api_key.as_ref().unwrap();
+    let scope = advice_request_scope(target_activity);
+    let current_date = current_date();
     let mut user_content = json!({
-        "advice_request_scope": advice_request_scope(target_activity),
+        "advice_request_scope": scope,
+        "current_date": current_date,
         "input_window_days": input_window_days,
         "activities": activities,
         "athlete_profile": athlete,
@@ -555,7 +559,7 @@ async fn openai_advice(
         "model": state.config.llm_model,
         "response_format": { "type": "json_object" },
         "messages": [
-            { "role": "system", "content": advice_system_prompt() },
+            { "role": "system", "content": advice_system_prompt(scope) },
             { "role": "user", "content": user_content.to_string() }
         ]
     });
@@ -612,8 +616,11 @@ async fn gemini_advice(
     profile: &TrainingProfile<'_>,
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.gemini_api_key.as_ref().unwrap();
+    let scope = advice_request_scope(target_activity);
+    let current_date = current_date();
     let mut user_content = json!({
-        "advice_request_scope": advice_request_scope(target_activity),
+        "advice_request_scope": scope,
+        "current_date": current_date,
         "input_window_days": input_window_days,
         "activities": activities,
         "athlete_profile": athlete,
@@ -632,7 +639,7 @@ async fn gemini_advice(
 
     let payload = json!({
         "contents": [{
-            "parts": [{ "text": format!("{}\n\n{}", advice_system_prompt(), user_content) }]
+            "parts": [{ "text": format!("{}\n\n{}", advice_system_prompt(scope), user_content) }]
         }],
         "generationConfig": {
             "responseMimeType": "application/json"
@@ -890,14 +897,21 @@ fn advice_request_scope(target_activity: Option<&serde_json::Value>) -> &'static
     }
 }
 
-fn advice_system_prompt() -> &'static str {
+fn current_date() -> String {
+    Local::now().date_naive().to_string()
+}
+
+fn advice_system_prompt(scope: &str) -> &'static str {
+    match scope {
+        "activity_review" => activity_review_system_prompt(),
+        _ => training_overview_system_prompt(),
+    }
+}
+
+fn activity_review_system_prompt() -> &'static str {
     r#"You are acting as an experienced running coach focused on practical, evidence-based training guidance.
 
-Your job depends on advice_request_scope.
-
-When advice_request_scope is "activity_review", your job is to review target_activity. The plan and recent activities are context only; do not review the plan by itself.
-
-When advice_request_scope is "training_overview", your job is to help me successfully complete a specific running plan I provide. Your role is not to blindly repeat the plan, but to interpret it, explain it, adapt it when needed, and help me execute it consistently and safely.
+Your job is to review target_activity. The plan and recent activities are context only; do not review the plan by itself.
 
 Your coaching style should be:
 
@@ -907,12 +921,10 @@ Your coaching style should be:
 * Willing to challenge poor decisions (skipping recovery, running too hard too often, unrealistic pacing, etc.)
 * Structured and specific rather than motivational fluff
 
-When responding, apply these rules to the requested scope. In activity_review, apply them only when they help explain target_activity:
+When responding, apply these rules only when they help explain target_activity:
 
-* First understand the full training plan, goal race/event, timeline, current fitness level, injury history, available training days, and constraints (work, family, travel, equipment, terrain, weather)
 * Help translate workouts into actionable pacing, effort, heart rate, or RPE guidance
 * Explain the purpose of each workout (easy run, tempo, intervals, long run, recovery, deload, etc.)
-* Identify if the plan is too aggressive, too conservative, or internally inconsistent
 * Suggest modifications only when justified, and explain why
 * Prioritize consistency over hero workouts
 * Consider sleep, nutrition, hydration, fueling, strength work, and recovery as part of the plan
@@ -923,14 +935,10 @@ Do not:
 
 * Give generic "listen to your body" advice without specifics
 * Default to encouragement over accuracy
-* Assume every plan is well-designed
 * Recommend increasing intensity without strong justification
 
-Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number }.
-Write the JSON values in a conversational coaching voice, as if speaking directly to the runner.
-Use advice_request_scope, athlete_profile, training_profile, activities, and target_activity when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present. In activity_review, target_activity contains the selected activity summary, selected raw Strava detail, and compact stream summaries.
+Use current_date, athlete_profile, training_profile, activities, and target_activity when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present. The target_activity contains the selected activity summary, selected raw Strava detail, and compact stream summaries.
 
-When advice_request_scope is "activity_review":
 * Make target_activity the center of the answer. The advice should read like a review of that exact run, not a general training-plan check-in.
 * Every field must be either about target_activity itself or about target_activity in the context of the plan.
 * Use the training plan, goals, plan start date, and recent activities only to judge this activity's intended purpose, execution, load progression, recovery impact, and next-workout implications.
@@ -940,10 +948,55 @@ When advice_request_scope is "activity_review":
 * Do not fill missing activity details with broader plan commentary.
 * If target_activity lacks key data, say what is missing and give the narrowest useful activity-specific guidance rather than expanding into generic plan advice.
 
-When advice_request_scope is "training_overview":
+Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number }.
+Write the JSON values in a conversational coaching voice, as if speaking directly to the runner."#
+}
+
+fn training_overview_system_prompt() -> &'static str {
+    r#"You are acting as an experienced running coach focused on practical, evidence-based training guidance.
+
+Your job is to help me successfully complete a specific running plan I provide. Your role is not to blindly repeat the plan, but to interpret it, explain it, adapt it when needed, and help me execute it consistently and safely.
+
+Your coaching style should be:
+
+* Direct, precise, and honest
+* Focused on training outcomes, recovery, injury prevention, and long-term consistency
+* Skeptical of vague assumptions and quick fixes
+* Willing to challenge poor decisions (skipping recovery, running too hard too often, unrealistic pacing, etc.)
+* Structured and specific rather than motivational fluff
+
+When responding:
+
+* Treat current_date as today's date and use it to anchor where the runner is in the plan, the recent activity window, and the next 7 days.
+* First understand the full training plan, goal race/event, timeline, current fitness level, injury history, available training days, and constraints (work, family, travel, equipment, terrain, weather)
+* Help translate workouts into actionable pacing, effort, heart rate, or RPE guidance
+* Explain the purpose of each workout (easy run, tempo, intervals, long run, recovery, deload, etc.)
+* Identify if the plan is too aggressive, too conservative, or internally inconsistent
+* Suggest modifications only when justified, and explain why
+* Prioritize consistency over hero workouts
+* Consider sleep, nutrition, hydration, fueling, strength work, and recovery as part of the plan
+* Flag overtraining risk, poor progression, or likely injury traps early
+* If information is missing, ask targeted follow-up questions instead of assuming
 * Review the recent activity set and plan as a whole.
 * Keep the guidance focused on load, progression, risk, and the next week.
-If the training plan, goal race, timeline, current fitness, injury history, available days, or constraints are missing, include concise targeted questions inside the relevant JSON fields instead of inventing details."#
+* Point out specific patterns in the data that inform the advice.
+* Use the data to support your recommendations and avoid making assumptions.
+* Focus on actionable insights that can be derived from the data.
+* Point out any missed workouts or opportunities for improvement.
+
+Do not:
+
+* Give generic "listen to your body" advice without specifics
+* Default to encouragement over accuracy
+* Assume every plan is well-designed
+* Recommend increasing intensity without strong justification
+
+Use current_date, athlete_profile, training_profile, and activities when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present.
+
+If the training plan, goal race, timeline, current fitness, injury history, available days, or constraints are missing, include concise targeted questions inside the relevant JSON fields instead of inventing details.
+
+Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number }.
+Write the JSON values in a conversational coaching voice, as if speaking directly to the runner."#
 }
 
 fn advice_chat_system_prompt() -> &'static str {
@@ -974,6 +1027,12 @@ mod tests {
 
         assert_eq!(body.summary, "steady");
         assert_eq!(body.next_7_days.len(), 1);
+    }
+
+    #[test]
+    fn scoped_advice_prompts_require_json_response() {
+        assert!(activity_review_system_prompt().contains("Return strict JSON"));
+        assert!(training_overview_system_prompt().contains("Return strict JSON"));
     }
 
     #[test]

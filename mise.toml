@@ -3,6 +3,9 @@ bun = "1"
 node = "22"
 rust = "stable"
 
+[settings]
+raw = true
+
 [tasks.dev]
 description = "Run the Rust API and Vite app in separate terminals"
 run = "echo 'Run `mise run api:dev` and `mise run web:dev` in separate shells'"
