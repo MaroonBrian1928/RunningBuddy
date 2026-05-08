@@ -40,19 +40,14 @@ const CONFIGURED_MAP_STYLE_URL = envValue(import.meta.env.VITE_MAP_STYLE_URL);
 
 const FALLBACK_MAP_STYLE: StyleSpecification = {
   version: 8,
-  sources: {
-    osm: {
-      type: "raster",
-      tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-      tileSize: 256,
-      attribution: "© OpenStreetMap contributors"
-    }
-  },
+  sources: {},
   layers: [
     {
-      id: "osm",
-      type: "raster",
-      source: "osm"
+      id: "route-background",
+      type: "background",
+      paint: {
+        "background-color": "#e8eee9"
+      }
     }
   ]
 };
@@ -69,11 +64,17 @@ type RouteGeoJson = {
   };
 };
 
+type SyncWatchState = {
+  lastCompletedSyncAt?: string | null;
+  failedJobs: number;
+  sawActiveJob: boolean;
+};
+
 export function App() {
   const queryClient = useQueryClient();
   const [selectedActivityId, setSelectedActivityId] = useState<number | null>(null);
   const [showAthleteConfig, setShowAthleteConfig] = useState(false);
-  const [isWatchingSync, setIsWatchingSync] = useState(false);
+  const [syncWatch, setSyncWatch] = useState<SyncWatchState | null>(null);
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const activities = useQuery({
     queryKey: ["activities"],
@@ -91,7 +92,7 @@ export function App() {
     enabled: me.data?.authenticated === true,
     refetchInterval: (query) => {
       const status = query.state.data as StravaStatus | undefined;
-      return isWatchingSync || hasActiveSync(status) ? 2000 : false;
+      return syncWatch || hasActiveSync(status) ? 2000 : false;
     }
   });
   const selectedActivity = useQuery({
@@ -114,14 +115,31 @@ export function App() {
   });
 
   useEffect(() => {
-    if (!isWatchingSync || !stravaStatus.data || hasActiveSync(stravaStatus.data)) {
+    if (!syncWatch || !stravaStatus.data) {
       return;
     }
 
-    setIsWatchingSync(false);
+    if (hasActiveSync(stravaStatus.data)) {
+      if (!syncWatch.sawActiveJob) {
+        setSyncWatch({ ...syncWatch, sawActiveJob: true });
+      }
+      return;
+    }
+
+    const syncFinished = syncWatch.sawActiveJob
+      || stravaStatus.data.last_completed_sync_at !== syncWatch.lastCompletedSyncAt
+      || stravaStatus.data.failed_jobs > syncWatch.failedJobs;
+
+    if (!syncFinished) {
+      return;
+    }
+
+    setSyncWatch(null);
     queryClient.invalidateQueries({ queryKey: ["activities"] });
+    queryClient.invalidateQueries({ queryKey: ["activity"] });
     queryClient.invalidateQueries({ queryKey: ["advice"] });
-  }, [isWatchingSync, queryClient, stravaStatus.data]);
+    queryClient.invalidateQueries({ queryKey: ["stravaStatus"] });
+  }, [queryClient, stravaStatus.data, syncWatch]);
 
   if (me.isLoading) {
     return <Shell><p className="muted">Loading session...</p></Shell>;
@@ -152,12 +170,18 @@ export function App() {
         <section className="configPanel" aria-label="Athlete configuration">
           <div className="configHeader">
             <h2>Athlete Configuration</h2>
-            <StravaActions onSyncQueued={() => setIsWatchingSync(true)} />
+            <StravaActions
+              onSyncQueued={() => setSyncWatch({
+                lastCompletedSyncAt: stravaStatus.data?.last_completed_sync_at,
+                failedJobs: stravaStatus.data?.failed_jobs ?? 0,
+                sawActiveJob: false
+              })}
+            />
           </div>
           <StravaStatusPanel
             status={stravaStatus.data}
             isLoading={stravaStatus.isLoading}
-            isLive={isWatchingSync || hasActiveSync(stravaStatus.data)}
+            isLive={Boolean(syncWatch) || hasActiveSync(stravaStatus.data)}
           />
           <TrainingPlanPanel me={me.data} />
         </section>
@@ -545,9 +569,7 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
         onError={() => {
           if (mapStyle !== FALLBACK_MAP_STYLE) {
             setMapStyle(FALLBACK_MAP_STYLE);
-            setStyleWarning("Map style failed to load, using the fallback basemap.");
-          } else {
-            setStyleWarning("Basemap tiles failed to load. Check network access or configure VITE_MAP_STYLE_URL.");
+            setStyleWarning("Map style failed to load, using the local route view.");
           }
         }}
       >

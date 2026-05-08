@@ -184,13 +184,31 @@ describe("App", () => {
 
   it("keeps Strava sync status live after queuing a manual sync", async () => {
     let statusCalls = 0;
+    let activitiesCalls = 0;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
       const path = input.toString();
       if (path.endsWith("/api/auth/me")) {
         return jsonResponse({ authenticated: true, username: "admin" });
       }
       if (path.endsWith("/api/activities")) {
-        return jsonResponse([]);
+        activitiesCalls += 1;
+        return jsonResponse(activitiesCalls > 1
+          ? [
+              {
+                id: 1,
+                strava_activity_id: 100,
+                name: "Fresh sync run",
+                sport_type: "Run",
+                start_date: "2026-04-20T12:00:00Z",
+                moving_time_seconds: 1800,
+                distance_meters: 8046.72,
+                average_heartrate: 145,
+                total_elevation_gain: 50,
+                deleted_at: null,
+                private_unavailable: 0
+              }
+            ]
+          : []);
       }
       if (path.endsWith("/api/advice")) {
         return jsonResponse([]);
@@ -202,10 +220,10 @@ describe("App", () => {
           connected: true,
           athlete: null,
           scopes: ["read", "activity:read"],
-          queued_jobs: statusCalls > 1 ? 1 : 0,
+          queued_jobs: 0,
           running_jobs: 0,
           failed_jobs: 0,
-          last_completed_sync_at: null
+          last_completed_sync_at: statusCalls > 1 ? "2026-04-20T12:01:00Z" : null
         });
       }
       if (path.endsWith("/api/strava/sync") && init?.method === "POST") {
@@ -225,7 +243,9 @@ describe("App", () => {
         expect.objectContaining({ method: "POST" })
       );
     });
-    expect(await screen.findByText("1 sync job active")).toBeInTheDocument();
+    expect(await screen.findByText("Fresh sync run")).toBeInTheDocument();
+    expect(screen.getByText("1")).toBeInTheDocument();
+    expect(screen.getByText("5.0")).toBeInTheDocument();
   });
 
   it("generates and shows activity-specific advice in the activity detail panel", async () => {

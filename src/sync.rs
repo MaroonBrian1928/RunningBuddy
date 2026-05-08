@@ -104,6 +104,9 @@ async fn sync_athlete_activities(
             let Some(strava_activity_id) = activity.get("id").and_then(Value::as_i64) else {
                 continue;
             };
+            if activity_summary_is_current(state, strava_activity_id, activity).await? {
+                continue;
+            }
             sync_activity_with_token(state, token, strava_activity_id, false).await?;
         }
     }
@@ -151,6 +154,18 @@ async fn sync_activity_with_token(
     Ok(())
 }
 
+async fn activity_summary_is_current(
+    state: &AppState,
+    strava_activity_id: i64,
+    activity: &Value,
+) -> anyhow::Result<bool> {
+    let Some(stored) = load_stored_activity_summary(state, strava_activity_id).await? else {
+        return Ok(false);
+    };
+
+    Ok(stored_activity_matches_list_summary(&stored, activity))
+}
+
 async fn sync_athlete_profile(state: &AppState, token: &TokenRow) -> anyhow::Result<()> {
     let athlete = strava_get_json(
         state,
@@ -181,6 +196,112 @@ async fn sync_athlete_profile(state: &AppState, token: &TokenRow) -> anyhow::Res
     .await?;
 
     Ok(())
+}
+
+async fn load_stored_activity_summary(
+    state: &AppState,
+    strava_activity_id: i64,
+) -> anyhow::Result<Option<StoredActivitySummary>> {
+    Ok(sqlx::query_as::<_, StoredActivitySummary>(
+        r#"
+        SELECT name, sport_type, start_date, elapsed_time_seconds, moving_time_seconds,
+               distance_meters, total_elevation_gain, average_heartrate, average_speed,
+               max_speed, average_cadence, average_watts, kilojoules, suffer_score,
+               visibility, deleted_at, private_unavailable
+        FROM activities
+        WHERE strava_activity_id = ?
+        "#,
+    )
+    .bind(strava_activity_id)
+    .fetch_optional(&state.db)
+    .await?)
+}
+
+fn stored_activity_matches_list_summary(stored: &StoredActivitySummary, activity: &Value) -> bool {
+    if stored.deleted_at.is_some() || stored.private_unavailable != 0 {
+        return false;
+    }
+
+    string_matches(&stored.name, activity.get("name").and_then(Value::as_str))
+        && optional_string_matches(
+            &stored.sport_type,
+            activity
+                .get("sport_type")
+                .or_else(|| activity.get("type"))
+                .and_then(Value::as_str),
+        )
+        && optional_string_matches(
+            &stored.start_date,
+            activity.get("start_date").and_then(Value::as_str),
+        )
+        && i64_matches(
+            stored.elapsed_time_seconds,
+            activity.get("elapsed_time").and_then(Value::as_i64),
+        )
+        && i64_matches(
+            stored.moving_time_seconds,
+            activity.get("moving_time").and_then(Value::as_i64),
+        )
+        && f64_matches(
+            stored.distance_meters,
+            activity.get("distance").and_then(Value::as_f64),
+        )
+        && f64_matches(
+            stored.total_elevation_gain,
+            activity.get("total_elevation_gain").and_then(Value::as_f64),
+        )
+        && f64_matches(
+            stored.average_heartrate,
+            activity.get("average_heartrate").and_then(Value::as_f64),
+        )
+        && f64_matches(
+            stored.average_speed,
+            activity.get("average_speed").and_then(Value::as_f64),
+        )
+        && f64_matches(
+            stored.max_speed,
+            activity.get("max_speed").and_then(Value::as_f64),
+        )
+        && f64_matches(
+            stored.average_cadence,
+            activity.get("average_cadence").and_then(Value::as_f64),
+        )
+        && f64_matches(
+            stored.average_watts,
+            activity.get("average_watts").and_then(Value::as_f64),
+        )
+        && f64_matches(
+            stored.kilojoules,
+            activity.get("kilojoules").and_then(Value::as_f64),
+        )
+        && f64_matches(
+            stored.suffer_score,
+            activity.get("suffer_score").and_then(Value::as_f64),
+        )
+        && optional_string_matches(
+            &stored.visibility,
+            activity.get("visibility").and_then(Value::as_str),
+        )
+}
+
+fn string_matches(stored: &str, listed: Option<&str>) -> bool {
+    listed.is_none_or(|value| stored == value)
+}
+
+fn optional_string_matches(stored: &Option<String>, listed: Option<&str>) -> bool {
+    listed.is_none_or(|value| stored.as_deref() == Some(value))
+}
+
+fn i64_matches(stored: Option<i64>, listed: Option<i64>) -> bool {
+    listed.is_none_or(|value| stored == Some(value))
+}
+
+fn f64_matches(stored: Option<f64>, listed: Option<f64>) -> bool {
+    listed.is_none_or(|value| {
+        stored
+            .map(|stored_value| (stored_value - value).abs() < 0.001)
+            .unwrap_or(false)
+    })
 }
 
 async fn fetch_activity_streams(
@@ -651,6 +772,27 @@ struct TokenRow {
     expires_at: i64,
 }
 
+#[derive(Debug, FromRow)]
+struct StoredActivitySummary {
+    name: String,
+    sport_type: Option<String>,
+    start_date: Option<String>,
+    elapsed_time_seconds: Option<i64>,
+    moving_time_seconds: Option<i64>,
+    distance_meters: Option<f64>,
+    total_elevation_gain: Option<f64>,
+    average_heartrate: Option<f64>,
+    average_speed: Option<f64>,
+    max_speed: Option<f64>,
+    average_cadence: Option<f64>,
+    average_watts: Option<f64>,
+    kilojoules: Option<f64>,
+    suffer_score: Option<f64>,
+    visibility: Option<String>,
+    deleted_at: Option<String>,
+    private_unavailable: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,5 +831,80 @@ mod tests {
         });
         assert_eq!(stream_data(&streams, "time").unwrap(), "[0,1,2]");
         assert!(stream_data(&streams, "watts").is_none());
+    }
+
+    #[test]
+    fn list_summary_match_skips_unchanged_activity_detail_fetch() {
+        let stored = StoredActivitySummary {
+            name: "Morning run".to_string(),
+            sport_type: Some("Run".to_string()),
+            start_date: Some("2026-04-20T12:00:00Z".to_string()),
+            elapsed_time_seconds: Some(1900),
+            moving_time_seconds: Some(1800),
+            distance_meters: Some(8046.72),
+            total_elevation_gain: Some(50.0),
+            average_heartrate: Some(145.0),
+            average_speed: Some(3.8),
+            max_speed: Some(5.2),
+            average_cadence: Some(82.0),
+            average_watts: None,
+            kilojoules: None,
+            suffer_score: Some(42.0),
+            visibility: Some("everyone".to_string()),
+            deleted_at: None,
+            private_unavailable: 0,
+        };
+        let activity = json!({
+            "id": 100,
+            "name": "Morning run",
+            "sport_type": "Run",
+            "start_date": "2026-04-20T12:00:00Z",
+            "elapsed_time": 1900,
+            "moving_time": 1800,
+            "distance": 8046.72,
+            "total_elevation_gain": 50.0,
+            "average_heartrate": 145.0,
+            "average_speed": 3.8,
+            "max_speed": 5.2,
+            "average_cadence": 82.0,
+            "suffer_score": 42.0,
+            "visibility": "everyone"
+        });
+
+        assert!(stored_activity_matches_list_summary(&stored, &activity));
+    }
+
+    #[test]
+    fn list_summary_mismatch_fetches_changed_activity_detail() {
+        let stored = StoredActivitySummary {
+            name: "Morning run".to_string(),
+            sport_type: Some("Run".to_string()),
+            start_date: Some("2026-04-20T12:00:00Z".to_string()),
+            elapsed_time_seconds: Some(1900),
+            moving_time_seconds: Some(1800),
+            distance_meters: Some(8046.72),
+            total_elevation_gain: Some(50.0),
+            average_heartrate: Some(145.0),
+            average_speed: Some(3.8),
+            max_speed: Some(5.2),
+            average_cadence: Some(82.0),
+            average_watts: None,
+            kilojoules: None,
+            suffer_score: Some(42.0),
+            visibility: Some("everyone".to_string()),
+            deleted_at: None,
+            private_unavailable: 0,
+        };
+        let activity = json!({
+            "id": 100,
+            "name": "Morning run",
+            "sport_type": "Run",
+            "start_date": "2026-04-20T12:00:00Z",
+            "elapsed_time": 1900,
+            "moving_time": 1800,
+            "distance": 9000.0
+        });
+
+        assert!(!stored_activity_matches_list_summary(&stored, &activity));
     }
 }
