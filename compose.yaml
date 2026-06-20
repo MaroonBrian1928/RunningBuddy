@@ -29,7 +29,11 @@ services:
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       GEMINI_BASE_URL: "${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}"
     volumes:
-      - runningbuddy-data:/data
-
-volumes:
-  runningbuddy-data:
+      - ./data:/data
+    healthcheck:
+      # Minimal image (bash only); probe the app's internal port via /dev/tcp.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
