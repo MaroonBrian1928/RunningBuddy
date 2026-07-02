@@ -36,3 +36,6 @@ frontend/*.tsbuildinfo
 
 # Stray curl cookie jar
 cookies.txt
+
+# CodeGraph local index (dev tooling)
+.codegraph/
