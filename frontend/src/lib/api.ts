@@ -47,7 +47,6 @@ export type TrainingAdvice = {
     next_7_days: string[];
     recovery_notes: string;
     confidence: number;
-    safety_note?: string;
   };
 };
 

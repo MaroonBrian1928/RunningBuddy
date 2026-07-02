@@ -286,6 +286,8 @@ textarea {
   display: grid;
   gap: 0.4rem;
   margin-top: 1rem;
+  max-height: min(55vh, 480px);
+  overflow-y: auto;
 }
 
 .row {
@@ -460,6 +462,14 @@ dd {
   .layout,
   .planGrid {
     grid-template-columns: 1fr;
+  }
+
+  .layout > :first-child {
+    order: 2;
+  }
+
+  .layout > :nth-child(2) {
+    order: 1;
   }
 
   .statusBand {

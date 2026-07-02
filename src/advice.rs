@@ -536,28 +536,26 @@ async fn openai_advice(
     let api_key = state.config.openai_api_key.as_ref().unwrap();
     let scope = advice_request_scope(target_activity);
     let current_date = current_date();
-    let mut user_content = json!({
-        "advice_request_scope": scope,
-        "current_date": current_date,
-        "input_window_days": input_window_days,
-        "activities": activities,
-        "athlete_profile": athlete,
-        "training_profile": {
-            "plan": profile.plan,
-            "goals": profile.goals,
-            "plan_start_date": profile.plan_start_date,
-        },
-    });
-    if let Some(activity) = target_activity {
-        user_content["target_activity"] = activity.clone();
-        user_content["response_focus"] = json!(
-            "Review target_activity only. Use the plan and recent activities only to explain this activity's execution, fit, load, recovery impact, and next-workout implications."
-        );
-    }
+    let user_content = build_user_content(
+        scope,
+        &current_date,
+        input_window_days,
+        activities,
+        target_activity,
+        athlete,
+        profile,
+    );
 
     let payload = json!({
         "model": state.config.llm_model,
-        "response_format": { "type": "json_object" },
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "training_advice",
+                "strict": true,
+                "schema": advice_response_schema(),
+            }
+        },
         "messages": [
             { "role": "system", "content": advice_system_prompt(scope) },
             { "role": "user", "content": user_content.to_string() }
@@ -618,31 +616,23 @@ async fn gemini_advice(
     let api_key = state.config.gemini_api_key.as_ref().unwrap();
     let scope = advice_request_scope(target_activity);
     let current_date = current_date();
-    let mut user_content = json!({
-        "advice_request_scope": scope,
-        "current_date": current_date,
-        "input_window_days": input_window_days,
-        "activities": activities,
-        "athlete_profile": athlete,
-        "training_profile": {
-            "plan": profile.plan,
-            "goals": profile.goals,
-            "plan_start_date": profile.plan_start_date,
-        },
-    });
-    if let Some(activity) = target_activity {
-        user_content["target_activity"] = activity.clone();
-        user_content["response_focus"] = json!(
-            "Review target_activity only. Use the plan and recent activities only to explain this activity's execution, fit, load, recovery impact, and next-workout implications."
-        );
-    }
+    let user_content = build_user_content(
+        scope,
+        &current_date,
+        input_window_days,
+        activities,
+        target_activity,
+        athlete,
+        profile,
+    );
 
     let payload = json!({
         "contents": [{
             "parts": [{ "text": format!("{}\n\n{}", advice_system_prompt(scope), user_content) }]
         }],
         "generationConfig": {
-            "responseMimeType": "application/json"
+            "responseMimeType": "application/json",
+            "responseSchema": advice_response_schema_gemini(),
         }
     });
     let response_result = state
@@ -824,9 +814,9 @@ async fn persist_advice(
         r#"
         INSERT INTO training_advice
             (activity_id, provider, model, input_window_days, summary, load_observations_json,
-             risks_json, next_7_days_json, recovery_notes, confidence, safety_note,
+             risks_json, next_7_days_json, recovery_notes, confidence,
              raw_response_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
         "#,
     )
@@ -840,7 +830,6 @@ async fn persist_advice(
     .bind(serde_json::to_string(&body.next_7_days).unwrap())
     .bind(&body.recovery_notes)
     .bind(body.confidence)
-    .bind(&body.safety_note)
     .bind(serde_json::to_string(body).unwrap())
     .fetch_one(&state.db)
     .await?;
@@ -885,7 +874,6 @@ fn local_fallback_advice(input_window_days: i64, has_target_activity: bool) -> T
         next_7_days,
         recovery_notes: "Prioritize sleep, hydration, and easy aerobic consistency.".into(),
         confidence: 0.2,
-        safety_note: String::new(),
     }
 }
 
@@ -901,17 +889,7 @@ fn current_date() -> String {
     Local::now().date_naive().to_string()
 }
 
-fn advice_system_prompt(scope: &str) -> &'static str {
-    match scope {
-        "activity_review" => activity_review_system_prompt(),
-        _ => training_overview_system_prompt(),
-    }
-}
-
-fn activity_review_system_prompt() -> &'static str {
-    r#"You are acting as an experienced running coach focused on practical, evidence-based training guidance.
-
-Your job is to review target_activity. The plan and recent activities are context only; do not review the plan by itself.
+const COACH_PERSONA: &str = r#"You are acting as an experienced running coach focused on practical, evidence-based training guidance.
 
 Your coaching style should be:
 
@@ -920,6 +898,30 @@ Your coaching style should be:
 * Skeptical of vague assumptions and quick fixes
 * Willing to challenge poor decisions (skipping recovery, running too hard too often, unrealistic pacing, etc.)
 * Structured and specific rather than motivational fluff
+
+Do not:
+
+* Give generic "listen to your body" advice without specifics
+* Default to encouragement over accuracy
+* Recommend increasing intensity without strong justification"#;
+
+const JSON_CONTRACT: &str = r#"Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number between 0 and 1 }.
+Write the JSON values in a conversational coaching voice, as if speaking directly to the runner."#;
+
+fn advice_system_prompt(scope: &str) -> &'static str {
+    match scope {
+        "activity_review" => activity_review_system_prompt(),
+        _ => training_overview_system_prompt(),
+    }
+}
+
+fn activity_review_system_prompt() -> &'static str {
+    static PROMPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROMPT.get_or_init(|| {
+        format!(
+            r#"{persona}
+
+Your job is to review target_activity. The plan and recent activities are context only; do not review the plan by itself.
 
 When responding, apply these rules only when they help explain target_activity:
 
@@ -931,13 +933,7 @@ When responding, apply these rules only when they help explain target_activity:
 * Flag overtraining risk, poor progression, or likely injury traps early
 * If information is missing, ask targeted follow-up questions instead of assuming
 
-Do not:
-
-* Give generic "listen to your body" advice without specifics
-* Default to encouragement over accuracy
-* Recommend increasing intensity without strong justification
-
-Use current_date, athlete_profile, training_profile, activities, and target_activity when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present. The target_activity contains the selected activity summary, selected raw Strava detail, and compact stream summaries.
+Use athlete_profile, training_profile, activities, and target_activity when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present. The target_activity contains the selected activity summary, selected raw Strava detail, and compact stream summaries.
 
 * Make target_activity the center of the answer. The advice should read like a review of that exact run, not a general training-plan check-in.
 * Every field must be either about target_activity itself or about target_activity in the context of the plan.
@@ -948,22 +944,20 @@ Use current_date, athlete_profile, training_profile, activities, and target_acti
 * Do not fill missing activity details with broader plan commentary.
 * If target_activity lacks key data, say what is missing and give the narrowest useful activity-specific guidance rather than expanding into generic plan advice.
 
-Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number }.
-Write the JSON values in a conversational coaching voice, as if speaking directly to the runner."#
+{contract}"#,
+            persona = COACH_PERSONA,
+            contract = JSON_CONTRACT,
+        )
+    }).as_str()
 }
 
 fn training_overview_system_prompt() -> &'static str {
-    r#"You are acting as an experienced running coach focused on practical, evidence-based training guidance.
+    static PROMPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROMPT.get_or_init(|| {
+        format!(
+            r#"{persona}
 
 Your job is to help me successfully complete a specific running plan I provide. Your role is not to blindly repeat the plan, but to interpret it, explain it, adapt it when needed, and help me execute it consistently and safely.
-
-Your coaching style should be:
-
-* Direct, precise, and honest
-* Focused on training outcomes, recovery, injury prevention, and long-term consistency
-* Skeptical of vague assumptions and quick fixes
-* Willing to challenge poor decisions (skipping recovery, running too hard too often, unrealistic pacing, etc.)
-* Structured and specific rather than motivational fluff
 
 When responding:
 
@@ -984,23 +978,79 @@ When responding:
 * Focus on actionable insights that can be derived from the data.
 * Point out any missed workouts or opportunities for improvement.
 
-Do not:
-
-* Give generic "listen to your body" advice without specifics
-* Default to encouragement over accuracy
-* Assume every plan is well-designed
-* Recommend increasing intensity without strong justification
+Also do not assume every plan is well-designed.
 
 Use current_date, athlete_profile, training_profile, and activities when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present.
 
 If the training plan, goal race, timeline, current fitness, injury history, available days, or constraints are missing, include concise targeted questions inside the relevant JSON fields instead of inventing details.
 
-Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number }.
-Write the JSON values in a conversational coaching voice, as if speaking directly to the runner."#
+{contract}"#,
+            persona = COACH_PERSONA,
+            contract = JSON_CONTRACT,
+        )
+    }).as_str()
 }
 
 fn advice_chat_system_prompt() -> &'static str {
-    "You are a running coach continuing a conversation about previously generated training advice. Answer conversationally in plain text, not JSON. Be specific, concise, and practical. Use the saved_advice as the source of truth, answer the latest user follow-up, and ask one targeted question when key information is missing. Do not add repeated safety disclaimers; the app displays one shared footer disclaimer."
+    "You are a running coach continuing a conversation about previously generated training advice. Answer conversationally in plain text, not JSON. Be specific, concise, and practical. Keep replies under 150 words unless the user explicitly asks for a plan, table, or longer breakdown. Use the saved_advice as the source of truth, answer the latest user follow-up, and ask one targeted question when key information is missing. Do not add repeated safety disclaimers; the app displays one shared footer disclaimer."
+}
+
+fn build_user_content(
+    scope: &str,
+    current_date: &str,
+    input_window_days: i64,
+    activities: &[serde_json::Value],
+    target_activity: Option<&serde_json::Value>,
+    athlete: Option<&serde_json::Value>,
+    profile: &TrainingProfile<'_>,
+) -> serde_json::Value {
+    let mut content = json!({
+        "advice_request_scope": scope,
+        "current_date": current_date,
+        "input_window_days": input_window_days,
+        "activities": activities,
+        "athlete_profile": athlete,
+        "training_profile": {
+            "plan": profile.plan,
+            "goals": profile.goals,
+            "plan_start_date": profile.plan_start_date,
+        },
+    });
+    if let Some(activity) = target_activity {
+        content["target_activity"] = activity.clone();
+    }
+    content
+}
+
+fn advice_response_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "load_observations", "risks", "next_7_days", "recovery_notes", "confidence"],
+        "properties": {
+            "summary": { "type": "string" },
+            "load_observations": { "type": "array", "items": { "type": "string" } },
+            "risks": { "type": "array", "items": { "type": "string" } },
+            "next_7_days": { "type": "array", "items": { "type": "string" } },
+            "recovery_notes": { "type": "string" },
+            "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+    })
+}
+
+fn advice_response_schema_gemini() -> serde_json::Value {
+    json!({
+        "type": "OBJECT",
+        "required": ["summary", "load_observations", "risks", "next_7_days", "recovery_notes", "confidence"],
+        "properties": {
+            "summary": { "type": "STRING" },
+            "load_observations": { "type": "ARRAY", "items": { "type": "STRING" } },
+            "risks": { "type": "ARRAY", "items": { "type": "STRING" } },
+            "next_7_days": { "type": "ARRAY", "items": { "type": "STRING" } },
+            "recovery_notes": { "type": "STRING" },
+            "confidence": { "type": "NUMBER" }
+        }
+    })
 }
 
 fn default_window() -> i64 {

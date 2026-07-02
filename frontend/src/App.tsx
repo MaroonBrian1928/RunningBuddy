@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Map, { Layer, Source } from "react-map-gl/maplibre";
 import type { StyleSpecification } from "maplibre-gl";
@@ -113,6 +113,24 @@ export function App() {
     mutationFn: api.logout,
     onSuccess: () => queryClient.invalidateQueries()
   });
+
+  const lastCompletedSyncAtRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const current = stravaStatus.data?.last_completed_sync_at;
+    if (current === undefined) {
+      return;
+    }
+    if (lastCompletedSyncAtRef.current === undefined) {
+      lastCompletedSyncAtRef.current = current;
+      return;
+    }
+    if (lastCompletedSyncAtRef.current !== current) {
+      lastCompletedSyncAtRef.current = current;
+      queryClient.invalidateQueries({ queryKey: ["activities"] });
+      queryClient.invalidateQueries({ queryKey: ["activity"] });
+      queryClient.invalidateQueries({ queryKey: ["advice"] });
+    }
+  }, [queryClient, stravaStatus.data?.last_completed_sync_at]);
 
   useEffect(() => {
     if (!syncWatch || !stravaStatus.data) {

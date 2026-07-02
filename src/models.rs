@@ -49,8 +49,6 @@ pub struct TrainingAdviceBody {
     pub next_7_days: Vec<String>,
     pub recovery_notes: String,
     pub confidence: f64,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub safety_note: String,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -66,7 +64,6 @@ pub struct TrainingAdviceRow {
     pub next_7_days_json: String,
     pub recovery_notes: String,
     pub confidence: f64,
-    pub safety_note: String,
     pub raw_response_json: String,
     pub created_at: String,
 }
@@ -98,7 +95,6 @@ impl TrainingAdviceRow {
                 next_7_days: serde_json::from_str(&self.next_7_days_json).unwrap_or_default(),
                 recovery_notes: self.recovery_notes,
                 confidence: self.confidence,
-                safety_note: self.safety_note,
             },
             created_at: self.created_at,
         }
