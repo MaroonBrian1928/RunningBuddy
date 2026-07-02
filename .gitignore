@@ -33,3 +33,6 @@ frontend/*.tsbuildinfo
 
 # runtime data (bind-mounted Docker volume; backed up by restic, not git)
 /data/
+
+# Stray curl cookie jar
+cookies.txt

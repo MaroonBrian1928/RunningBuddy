@@ -21,6 +21,16 @@ mise run test
 
 The frontend dev server proxies `/api` and `/strava` requests to the Rust API.
 
+## Security
+
+This is a single-athlete, local-first app. Before exposing it beyond
+`127.0.0.1`, change every `change-me` default in `.env` — in particular
+`RUNNINGBUDDY_ADMIN_PASSWORD` and `STRAVA_VERIFY_TOKEN`. All secrets
+(Strava OAuth credentials, LLM API keys, admin password) come from `.env`,
+which is gitignored and never committed. The runtime SQLite database
+(`runningbuddy.db` / the `./data` bind mount) holds live Strava tokens and
+activity data and is likewise kept out of git.
+
 ## Docker
 
 Build and run the combined API/frontend image:
