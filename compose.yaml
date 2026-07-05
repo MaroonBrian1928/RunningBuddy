@@ -9,6 +9,7 @@ services:
     ports:
       - "${RUNNINGBUDDY_PORT:-7317}:3000"
     environment:
+      TZ: "${TZ:-America/Chicago}"
       RUST_LOG: "info,runningbuddy=debug"
       RUNNINGBUDDY_BIND_ADDR: "0.0.0.0:3000"
       # RUNNINGBUDDY_DATABASE_URL: "sqlite:///data/runningbuddy.db"

@@ -39,3 +39,6 @@ cookies.txt
 
 # CodeGraph local index (dev tooling)
 .codegraph/
+
+# Local working documents (not for the public repo)
+docs/improvement-plan.md

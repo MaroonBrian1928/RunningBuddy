@@ -456,18 +456,19 @@ async fn upsert_activity(
     sqlx::query(
         r#"
         INSERT INTO activities
-            (strava_activity_id, athlete_id, name, sport_type, start_date,
+            (strava_activity_id, athlete_id, name, sport_type, start_date, start_date_local,
              elapsed_time_seconds, moving_time_seconds, distance_meters,
              total_elevation_gain, average_heartrate, max_heartrate,
              average_speed, max_speed, average_cadence, average_watts,
              kilojoules, suffer_score, visibility, deleted_at, private_unavailable,
              raw_activity_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)
         ON CONFLICT(strava_activity_id) DO UPDATE SET
             athlete_id = excluded.athlete_id,
             name = excluded.name,
             sport_type = excluded.sport_type,
             start_date = excluded.start_date,
+            start_date_local = excluded.start_date_local,
             elapsed_time_seconds = excluded.elapsed_time_seconds,
             moving_time_seconds = excluded.moving_time_seconds,
             distance_meters = excluded.distance_meters,
@@ -502,6 +503,7 @@ async fn upsert_activity(
             .and_then(Value::as_str),
     )
     .bind(activity.get("start_date").and_then(Value::as_str))
+    .bind(activity.get("start_date_local").and_then(Value::as_str))
     .bind(activity.get("elapsed_time").and_then(Value::as_i64))
     .bind(activity.get("moving_time").and_then(Value::as_i64))
     .bind(activity.get("distance").and_then(Value::as_f64))

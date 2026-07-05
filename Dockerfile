@@ -29,7 +29,7 @@ RUN cargo build --release
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUNNINGBUDDY_BIND_ADDR=0.0.0.0:3000 \
