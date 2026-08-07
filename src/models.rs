@@ -46,6 +46,9 @@ pub struct TrainingAdviceBody {
     pub summary: String,
     pub load_observations: Vec<String>,
     pub risks: Vec<String>,
+    // Default so advice saved before this field existed still parses.
+    #[serde(default)]
+    pub last_7_days: Vec<String>,
     pub next_7_days: Vec<String>,
     pub recovery_notes: String,
     pub confidence: f64,
@@ -61,6 +64,7 @@ pub struct TrainingAdviceRow {
     pub summary: String,
     pub load_observations_json: String,
     pub risks_json: String,
+    pub last_7_days_json: String,
     pub next_7_days_json: String,
     pub recovery_notes: String,
     pub confidence: f64,
@@ -92,6 +96,7 @@ impl TrainingAdviceRow {
                 load_observations: serde_json::from_str(&self.load_observations_json)
                     .unwrap_or_default(),
                 risks: serde_json::from_str(&self.risks_json).unwrap_or_default(),
+                last_7_days: serde_json::from_str(&self.last_7_days_json).unwrap_or_default(),
                 next_7_days: serde_json::from_str(&self.next_7_days_json).unwrap_or_default(),
                 recovery_notes: self.recovery_notes,
                 confidence: self.confidence,

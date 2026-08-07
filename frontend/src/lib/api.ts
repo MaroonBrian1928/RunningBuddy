@@ -1,5 +1,6 @@
 export type MeResponse = {
   authenticated: boolean;
+  auto_sync_started?: boolean;
   username?: string | null;
   training_plan?: string | null;
   training_goals?: string | null;
@@ -44,6 +45,7 @@ export type TrainingAdvice = {
     summary: string;
     load_observations: string[];
     risks: string[];
+    last_7_days: string[];
     next_7_days: string[];
     recovery_notes: string;
     confidence: number;

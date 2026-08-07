@@ -80,6 +80,7 @@ describe("App", () => {
               summary: "Keep the easy volume steady.",
               load_observations: ["consistent"],
               risks: ["sharp increases"],
+              last_7_days: ["Solid easy week behind you"],
               next_7_days: ["Easy run"],
               recovery_notes: "Sleep well.",
               confidence: 0.7
@@ -312,6 +313,7 @@ describe("App", () => {
             summary: "This run fits well as aerobic maintenance.",
             load_observations: ["steady effort"],
             risks: ["watch the next hard day"],
+            last_7_days: ["Good consistency this past week"],
             next_7_days: ["Keep tomorrow easy"],
             recovery_notes: "Fuel and hydrate after the run.",
             confidence: 0.8

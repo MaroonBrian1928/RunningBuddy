@@ -41,6 +41,20 @@ struct TrainingProfile<'a> {
     plan: Option<&'a str>,
     goals: Option<&'a str>,
     plan_start_date: Option<&'a str>,
+    schedule_evaluation: Option<serde_json::Value>,
+}
+
+fn schedule_evaluation(
+    user: &auth::UserIdentity,
+    activities: &[serde_json::Value],
+) -> Option<serde_json::Value> {
+    let schedule = serde_json::from_str::<serde_json::Value>(user.plan_schedule_json.as_deref()?).ok()?;
+    crate::plan::evaluate_schedule(
+        &schedule,
+        user.plan_start_date.as_deref()?,
+        activities,
+        Local::now().date_naive(),
+    )
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -113,8 +127,9 @@ pub async fn generate(
         plan: user.training_plan.as_deref(),
         goals: user.training_goals.as_deref(),
         plan_start_date: user.plan_start_date.as_deref(),
+        schedule_evaluation: schedule_evaluation(&user, &window.activities),
     };
-    let body = request_advice(
+    let (body, request_payload) = request_advice(
         &state,
         input_window_days,
         &window,
@@ -123,7 +138,14 @@ pub async fn generate(
         &profile,
     )
     .await?;
-    let response = persist_advice(&state, input_window_days, payload.activity_id, &body).await?;
+    let response = persist_advice(
+        &state,
+        input_window_days,
+        payload.activity_id,
+        &body,
+        request_payload.as_ref(),
+    )
+    .await?;
     Ok(Json(response))
 }
 
@@ -176,6 +198,7 @@ pub async fn chat(
         plan: user.training_plan.as_deref(),
         goals: user.training_goals.as_deref(),
         plan_start_date: user.plan_start_date.as_deref(),
+        schedule_evaluation: schedule_evaluation(&user, &window.activities),
     };
     let message =
         request_advice_chat(&state, &advice.body, &payload.messages, &window, &profile).await?;
@@ -452,7 +475,42 @@ fn stream_summary(row: &TargetActivityRow) -> serde_json::Value {
         "altitude_meters": number_stats(&altitude),
         "duration_seconds": time.last().copied(),
         "distance_total_meters": distance.last().copied(),
+        "quarters": stream_quarter_stats(&heartrate, &velocity),
     })
+}
+
+/// Per-quarter averages so interval structure isn't hidden behind whole-run
+/// min/max/avg. Quarters are index-based, which tracks time closely for
+/// evenly sampled streams.
+fn stream_quarter_stats(heartrate: &[f64], velocity: &[f64]) -> serde_json::Value {
+    if heartrate.is_empty() && velocity.is_empty() {
+        return serde_json::Value::Null;
+    }
+
+    let quarter = |values: &[f64], index: usize| -> Option<Vec<f64>> {
+        if values.is_empty() {
+            return None;
+        }
+        let len = values.len();
+        let start = len * index / 4;
+        let end = len * (index + 1) / 4;
+        (start < end).then(|| values[start..end].to_vec())
+    };
+    let avg = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+
+    json!((0..4)
+        .map(|index| {
+            let pace = quarter(velocity, index).and_then(|chunk| {
+                let positive = chunk.iter().copied().filter(|value| *value > 0.0).collect::<Vec<_>>();
+                (!positive.is_empty()).then(|| 1609.344 / avg(&positive))
+            });
+            json!({
+                "quarter": index + 1,
+                "avg_heartrate": quarter(heartrate, index).map(|chunk| avg(&chunk)),
+                "avg_pace_seconds_per_mile": pace,
+            })
+        })
+        .collect::<Vec<_>>())
 }
 
 fn parse_number_stream(value: Option<&str>) -> Vec<f64> {
@@ -534,12 +592,12 @@ async fn request_advice(
     target_activity: Option<&serde_json::Value>,
     athlete: Option<&serde_json::Value>,
     profile: &TrainingProfile<'_>,
-) -> Result<TrainingAdviceBody> {
+) -> Result<(TrainingAdviceBody, Option<serde_json::Value>)> {
     if window.activities.is_empty() && target_activity.is_none() {
         tracing::info!("no activities available, using local fallback advice");
-        return Ok(local_fallback_advice(
-            input_window_days,
-            target_activity.is_some(),
+        return Ok((
+            local_fallback_advice(input_window_days, target_activity.is_some()),
+            None,
         ));
     }
 
@@ -551,54 +609,10 @@ async fn request_advice(
         has_athlete_profile = athlete.is_some(),
         has_training_plan = profile.plan.is_some(),
         has_training_goals = profile.goals.is_some(),
+        has_schedule_evaluation = profile.schedule_evaluation.is_some(),
         "requesting training advice"
     );
 
-    match state.config.llm_provider.as_str() {
-        "openai" if state.config.openai_api_key.is_some() => {
-            openai_advice(
-                state,
-                input_window_days,
-                window,
-                target_activity,
-                athlete,
-                profile,
-            )
-            .await
-        }
-        "gemini" if state.config.gemini_api_key.is_some() => {
-            gemini_advice(
-                state,
-                input_window_days,
-                window,
-                target_activity,
-                athlete,
-                profile,
-            )
-            .await
-        }
-        provider => {
-            tracing::warn!(
-                provider = provider,
-                "unknown or unconfigured LLM provider, using local fallback advice"
-            );
-            Ok(local_fallback_advice(
-                input_window_days,
-                target_activity.is_some(),
-            ))
-        }
-    }
-}
-
-async fn openai_advice(
-    state: &AppState,
-    input_window_days: i64,
-    window: &ActivityWindow,
-    target_activity: Option<&serde_json::Value>,
-    athlete: Option<&serde_json::Value>,
-    profile: &TrainingProfile<'_>,
-) -> Result<TrainingAdviceBody> {
-    let api_key = state.config.openai_api_key.as_ref().unwrap();
     let scope = advice_request_scope(target_activity);
     let user_content = build_user_content(
         scope,
@@ -609,6 +623,74 @@ async fn openai_advice(
         profile,
     );
 
+    let body = match state.config.llm_provider.as_str() {
+        "openai" if state.config.openai_api_key.is_some() => {
+            retry_once(|| openai_advice(state, scope, &user_content)).await?
+        }
+        "gemini" if state.config.gemini_api_key.is_some() => {
+            retry_once(|| gemini_advice(state, scope, &user_content)).await?
+        }
+        provider => {
+            tracing::warn!(
+                provider = provider,
+                "unknown or unconfigured LLM provider, using local fallback advice"
+            );
+            return Ok((
+                local_fallback_advice(input_window_days, target_activity.is_some()),
+                None,
+            ));
+        }
+    };
+    Ok((body, Some(user_content)))
+}
+
+/// Retry a provider call once on transient failures (network errors, 429,
+/// 5xx); map a persistent failure to a user-facing 502 instead of a raw 500.
+async fn retry_once<T, F, Fut>(mut call: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    match call().await {
+        Ok(value) => Ok(value),
+        Err(err) if is_transient(&err) => {
+            tracing::warn!(error = %err, "transient provider failure, retrying once");
+            call().await.map_err(|err| {
+                tracing::error!(error = %err, "provider failed after retry");
+                upstream_error()
+            })
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "provider request failed");
+            Err(upstream_error())
+        }
+    }
+}
+
+fn is_transient(err: &AppError) -> bool {
+    match err {
+        AppError::Reqwest(err) => err
+            .status()
+            .map(|status| status.is_server_error() || status.as_u16() == 429)
+            // No status means the request never completed (connect/timeout/etc.).
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+fn upstream_error() -> AppError {
+    AppError::Upstream(
+        "The coach model is currently unavailable. Your data is safe — try again in a moment."
+            .into(),
+    )
+}
+
+async fn openai_advice(
+    state: &AppState,
+    scope: &str,
+    user_content: &serde_json::Value,
+) -> Result<TrainingAdviceBody> {
+    let api_key = state.config.openai_api_key.as_ref().unwrap();
     let payload = json!({
         "model": state.config.llm_model,
         "response_format": {
@@ -670,23 +752,10 @@ async fn openai_advice(
 
 async fn gemini_advice(
     state: &AppState,
-    input_window_days: i64,
-    window: &ActivityWindow,
-    target_activity: Option<&serde_json::Value>,
-    athlete: Option<&serde_json::Value>,
-    profile: &TrainingProfile<'_>,
+    scope: &str,
+    user_content: &serde_json::Value,
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.gemini_api_key.as_ref().unwrap();
-    let scope = advice_request_scope(target_activity);
-    let user_content = build_user_content(
-        scope,
-        input_window_days,
-        window,
-        target_activity,
-        athlete,
-        profile,
-    );
-
     let payload = json!({
         "contents": [{
             "parts": [{ "text": format!("{}\n\n{}", advice_system_prompt(scope), user_content) }]
@@ -760,10 +829,10 @@ async fn request_advice_chat(
 ) -> Result<String> {
     match state.config.llm_provider.as_str() {
         "openai" if state.config.openai_api_key.is_some() => {
-            openai_advice_chat(state, advice, messages, window, profile).await
+            retry_once(|| openai_advice_chat(state, advice, messages, window, profile)).await
         }
         "gemini" if state.config.gemini_api_key.is_some() => {
-            gemini_advice_chat(state, advice, messages, window, profile).await
+            retry_once(|| gemini_advice_chat(state, advice, messages, window, profile)).await
         }
         _ => Ok(local_chat_fallback(advice, messages)),
     }
@@ -785,6 +854,7 @@ fn advice_chat_payload(
             "goals": profile.goals,
             "plan_start_date": profile.plan_start_date,
             "progress": plan_progress(profile, today),
+            "schedule_evaluation": profile.schedule_evaluation,
         },
         "activities": window.activities,
         "weekly_training_summary": window.weekly_summary,
@@ -870,6 +940,7 @@ fn advice_chat_context(advice: &TrainingAdviceBody) -> serde_json::Value {
         "summary": advice.summary,
         "load_observations": advice.load_observations,
         "risks": advice.risks,
+        "last_7_days": advice.last_7_days,
         "next_7_days": advice.next_7_days,
         "recovery_notes": advice.recovery_notes,
         "confidence": advice.confidence,
@@ -894,14 +965,15 @@ async fn persist_advice(
     input_window_days: i64,
     activity_id: Option<i64>,
     body: &TrainingAdviceBody,
+    request_payload: Option<&serde_json::Value>,
 ) -> Result<TrainingAdviceResponse> {
     let row = sqlx::query_as::<_, TrainingAdviceRow>(
         r#"
         INSERT INTO training_advice
             (activity_id, provider, model, input_window_days, summary, load_observations_json,
-             risks_json, next_7_days_json, recovery_notes, confidence,
-             raw_response_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             risks_json, last_7_days_json, next_7_days_json, recovery_notes, confidence,
+             raw_response_json, request_payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         RETURNING *
         "#,
     )
@@ -912,10 +984,12 @@ async fn persist_advice(
     .bind(&body.summary)
     .bind(serde_json::to_string(&body.load_observations).unwrap())
     .bind(serde_json::to_string(&body.risks).unwrap())
+    .bind(serde_json::to_string(&body.last_7_days).unwrap())
     .bind(serde_json::to_string(&body.next_7_days).unwrap())
     .bind(&body.recovery_notes)
     .bind(body.confidence)
     .bind(serde_json::to_string(body).unwrap())
+    .bind(request_payload.map(|payload| payload.to_string()))
     .fetch_one(&state.db)
     .await?;
     Ok(row.into_response())
@@ -956,6 +1030,9 @@ fn local_fallback_advice(input_window_days: i64, has_target_activity: bool) -> T
         risks: vec![
             "Avoid ramping volume or intensity sharply while the app has limited history.".into(),
         ],
+        last_7_days: vec![
+            "No coach model is configured, so the past week has not been reviewed yet.".into(),
+        ],
         next_7_days,
         recovery_notes: "Prioritize sleep, hydration, and easy aerobic consistency.".into(),
         confidence: 0.2,
@@ -986,7 +1063,8 @@ Do not:
 * Default to encouragement over accuracy
 * Recommend increasing intensity without strong justification"#;
 
-const JSON_CONTRACT: &str = r#"Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number between 0 and 1 }.
+const JSON_CONTRACT: &str = r#"Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "last_7_days": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number between 0 and 1 }.
+last_7_days is a backward-looking review of the past week: one entry per notable completed (or missed) session, referencing the specific activity by name/date and how it compared with the plan. next_7_days is the forward-looking week. Do not repeat the same content in both.
 Write the JSON values in a conversational coaching voice, as if speaking directly to the runner."#;
 
 fn advice_system_prompt(scope: &str) -> &'static str {
@@ -1014,7 +1092,7 @@ When responding, apply these rules only when they help explain target_activity:
 
 Dates: read data_notes and use each activity's local_date and local_day_of_week (the athlete's wall clock) to decide which calendar day it happened; start_date_utc can fall on a different day. current_date and current_day_of_week are the athlete's local today.
 
-Use athlete_profile, training_profile, activities, weekly_training_summary, and target_activity when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present. Use weekly_training_summary for weekly mileage totals rather than recomputing them yourself. The target_activity contains the selected activity summary (including splits, laps, and best efforts when available) and compact stream summaries.
+Use athlete_profile, training_profile, activities, weekly_training_summary, and target_activity when provided. The athlete_profile includes compact Strava athlete details and gear mileage when available. The activities list contains compact summaries for all synced, available activities in the requested window, including cross-training when present. Use weekly_training_summary for weekly mileage totals rather than recomputing them yourself. When training_profile.schedule_evaluation is present, trust its statuses for what the plan called for around this activity (completed_early/completed_late mean done, shifted a day; pending_today/pending_makeup mean not done yet, never skipped). The target_activity contains the selected activity summary (including splits, laps, and best efforts when available) and compact stream summaries; stream_summary.quarters gives per-quarter average heart rate and pace, useful for judging pacing structure and drift.
 
 * Make target_activity the center of the answer. The advice should read like a review of that exact run, not a general training-plan check-in.
 * Every field must be either about target_activity itself or about target_activity in the context of the plan.
@@ -1044,7 +1122,8 @@ When responding:
 
 * Treat current_date and current_day_of_week as the runner's local today and use them, together with training_profile.progress (days_since_plan_start, plan_week_number), to anchor where the runner is in the plan, the recent activity window, and the next 7 days.
 * Read data_notes. Each activity's local_date and local_day_of_week give the runner's calendar day; start_date_utc is UTC and can fall on a different day. Always match plan days against local_date, never against the UTC timestamp.
-* Only describe a planned workout as skipped or missed when no activity exists on that local calendar date AND the date is fully in the past. Never call today's planned workout skipped: the day is not over and activities can sync late. If an activity on the right day roughly matches the planned distance or effort, treat the workout as completed, not missed.
+* When training_profile.schedule_evaluation is present, it is the authoritative day-by-day comparison of the plan against synced activities, computed by the app. Trust its statuses; do not re-derive them from timestamps. completed_early/completed_late mean the workout was done, just shifted a day — acknowledge the shift only if it matters for recovery spacing, and never count it as missed. Never call a pending_today or pending_makeup workout skipped.
+* When schedule_evaluation is absent, only describe a planned workout as skipped or missed when no activity exists on that local calendar date AND the date is fully in the past. Never call today's planned workout skipped: the day is not over and activities can sync late. If an activity on the right day roughly matches the planned distance or effort, treat the workout as completed, not missed.
 * Use weekly_training_summary for weekly mileage totals and activity counts rather than recomputing them from raw activities.
 * First understand the full training plan, goal race/event, timeline, current fitness level, injury history, available training days, and constraints (work, family, travel, equipment, terrain, weather)
 * Help translate workouts into actionable pacing, effort, heart rate, or RPE guidance
@@ -1074,7 +1153,7 @@ If the training plan, goal race, timeline, current fitness, injury history, avai
 }
 
 fn advice_chat_system_prompt() -> &'static str {
-    "You are a running coach continuing a conversation about previously generated training advice. Answer conversationally in plain text, not JSON. Be specific, concise, and practical. Keep replies under 150 words unless the user explicitly asks for a plan, table, or longer breakdown. Use saved_advice as the starting point, but ground answers in the provided training_profile, activities, and weekly_training_summary — they are the current data and win over saved_advice if the two disagree. Read data_notes: use each activity's local_date to decide which calendar day it happened, and treat current_date as the runner's local today. Answer the latest user follow-up, and ask one targeted question when key information is missing. Do not add repeated safety disclaimers; the app displays one shared footer disclaimer."
+    "You are a running coach continuing a conversation about previously generated training advice. Answer conversationally in plain text, not JSON. Be specific, concise, and practical. Keep replies under 150 words unless the user explicitly asks for a plan, table, or longer breakdown. Use saved_advice as the starting point, but ground answers in the provided training_profile, activities, and weekly_training_summary — they are the current data and win over saved_advice if the two disagree. When training_profile.schedule_evaluation is present, trust its statuses for whether planned workouts happened (completed_early/completed_late count as done; pending_today/pending_makeup are not misses). Read data_notes: use each activity's local_date to decide which calendar day it happened, and treat current_date as the runner's local today. Answer the latest user follow-up, and ask one targeted question when key information is missing. Do not add repeated safety disclaimers; the app displays one shared footer disclaimer."
 }
 
 const DATA_NOTES: &str = "All start_date_local, local_date, and local_day_of_week values are the athlete's wall-clock time; start_date_utc is UTC and can fall on a different calendar day. Use local_date to decide which day an activity happened. current_date/current_day_of_week are the athlete's local today. Activities can sync with a delay, so today may look incomplete.";
@@ -1104,6 +1183,7 @@ fn build_user_content(
             "goals": profile.goals,
             "plan_start_date": profile.plan_start_date,
             "progress": plan_progress(profile, today),
+            "schedule_evaluation": profile.schedule_evaluation,
         },
     });
     if let Some(activity) = target_activity {
@@ -1130,11 +1210,12 @@ fn advice_response_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["summary", "load_observations", "risks", "next_7_days", "recovery_notes", "confidence"],
+        "required": ["summary", "load_observations", "risks", "last_7_days", "next_7_days", "recovery_notes", "confidence"],
         "properties": {
             "summary": { "type": "string" },
             "load_observations": { "type": "array", "items": { "type": "string" } },
             "risks": { "type": "array", "items": { "type": "string" } },
+            "last_7_days": { "type": "array", "items": { "type": "string" } },
             "next_7_days": { "type": "array", "items": { "type": "string" } },
             "recovery_notes": { "type": "string" },
             "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
@@ -1145,11 +1226,12 @@ fn advice_response_schema() -> serde_json::Value {
 fn advice_response_schema_gemini() -> serde_json::Value {
     json!({
         "type": "OBJECT",
-        "required": ["summary", "load_observations", "risks", "next_7_days", "recovery_notes", "confidence"],
+        "required": ["summary", "load_observations", "risks", "last_7_days", "next_7_days", "recovery_notes", "confidence"],
         "properties": {
             "summary": { "type": "STRING" },
             "load_observations": { "type": "ARRAY", "items": { "type": "STRING" } },
             "risks": { "type": "ARRAY", "items": { "type": "STRING" } },
+            "last_7_days": { "type": "ARRAY", "items": { "type": "STRING" } },
             "next_7_days": { "type": "ARRAY", "items": { "type": "STRING" } },
             "recovery_notes": { "type": "STRING" },
             "confidence": { "type": "NUMBER" }
@@ -1261,13 +1343,19 @@ mod tests {
             plan: None,
             goals: None,
             plan_start_date: Some("2026-06-15"),
+            schedule_evaluation: None,
         };
         let today = NaiveDate::from_ymd_opt(2026, 7, 4).unwrap();
         let progress = plan_progress(&profile, today);
         assert_eq!(progress["days_since_plan_start"], 19);
         assert_eq!(progress["plan_week_number"], 3);
 
-        let none = TrainingProfile { plan: None, goals: None, plan_start_date: None };
+        let none = TrainingProfile {
+            plan: None,
+            goals: None,
+            plan_start_date: None,
+            schedule_evaluation: None,
+        };
         assert!(plan_progress(&none, today).is_null());
     }
 

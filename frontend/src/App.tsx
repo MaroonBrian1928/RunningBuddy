@@ -114,6 +114,21 @@ export function App() {
     onSuccess: () => queryClient.invalidateQueries()
   });
 
+  // The server queues a catch-up sync on the first visit of each day; watch it
+  // the same way we watch a manually triggered sync.
+  const autoSyncWatchedRef = useRef(false);
+  useEffect(() => {
+    if (!me.data?.auto_sync_started || autoSyncWatchedRef.current) {
+      return;
+    }
+    autoSyncWatchedRef.current = true;
+    setSyncWatch({
+      lastCompletedSyncAt: stravaStatus.data?.last_completed_sync_at,
+      failedJobs: stravaStatus.data?.failed_jobs ?? 0,
+      sawActiveJob: false
+    });
+  }, [me.data?.auto_sync_started, stravaStatus.data]);
+
   const lastCompletedSyncAtRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     const current = stravaStatus.data?.last_completed_sync_at;
@@ -732,6 +747,14 @@ function AdviceCard({ advice }: { advice: TrainingAdvice }) {
           <strong>Watch-outs</strong>
           <ul>
             {advice.body.risks.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        </div>
+      )}
+      {(advice.body.last_7_days ?? []).length > 0 && (
+        <div className="adviceSection">
+          <strong>Last 7 days</strong>
+          <ul>
+            {advice.body.last_7_days.map((item) => <li key={item}>{item}</li>)}
           </ul>
         </div>
       )}

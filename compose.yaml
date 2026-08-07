@@ -31,6 +31,9 @@ services:
       GEMINI_BASE_URL: "${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}"
     volumes:
       - ./data:/data
+    labels:
+      # autoheal (~/git/autoheal) restarts this container when unhealthy.
+      - autoheal=true
     healthcheck:
       # Minimal image (bash only); probe the app's internal port via /dev/tcp.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/3000"]

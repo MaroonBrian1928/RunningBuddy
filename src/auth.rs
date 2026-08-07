@@ -33,6 +33,10 @@ pub struct UpdateTrainingPlanRequest {
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     authenticated: bool,
+    /// True only on the request that queued today's automatic sync, so the UI
+    /// can start watching for it to finish.
+    #[serde(default)]
+    auto_sync_started: bool,
     username: Option<String>,
     training_plan: Option<String>,
     training_goals: Option<String>,
@@ -105,10 +109,18 @@ pub async fn login(
         .map_err(|err| AppError::BadRequest(err.to_string()))?,
     );
 
+    let auto_sync_started = crate::strava::maybe_enqueue_daily_sync(&state, user.id)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to queue automatic daily sync on login");
+            false
+        });
+
     Ok((
         headers,
         Json(MeResponse {
             authenticated: true,
+            auto_sync_started,
             username: Some(user.username),
             training_plan: user.training_plan,
             training_goals: user.training_goals,
@@ -143,8 +155,18 @@ pub async fn logout(
 
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>> {
     let user = current_user(&state, &headers).await.ok();
+    let mut auto_sync_started = false;
+    if let Some(user) = user.as_ref() {
+        // A visit is the trigger for the once-a-day catch-up sync. Never let a
+        // sync problem break the session check.
+        match crate::strava::maybe_enqueue_daily_sync(&state, user.id).await {
+            Ok(started) => auto_sync_started = started,
+            Err(err) => tracing::warn!(error = %err, "failed to queue automatic daily sync"),
+        }
+    }
     Ok(Json(MeResponse {
         authenticated: user.is_some(),
+        auto_sync_started,
         username: user.as_ref().map(|user| user.username.clone()),
         training_plan: user.as_ref().and_then(|user| user.training_plan.clone()),
         training_goals: user.as_ref().and_then(|user| user.training_goals.clone()),
@@ -158,12 +180,29 @@ pub async fn update_training_plan(
     Json(payload): Json<UpdateTrainingPlanRequest>,
 ) -> Result<impl IntoResponse> {
     let user = require_user(&state, &headers).await?;
+    let training_plan = clean_optional(payload.training_plan);
+    // Re-derive the structured schedule when the plan text changes or no
+    // schedule is stored yet; keep the existing one for an unchanged plan so
+    // a provider outage can't wipe it.
+    let plan_schedule_json = match &training_plan {
+        Some(text)
+            if user.training_plan.as_deref() == Some(text.as_str())
+                && user.plan_schedule_json.is_some() =>
+        {
+            user.plan_schedule_json.clone()
+        }
+        Some(text) => crate::plan::structure_training_plan(&state, text)
+            .await
+            .map(|schedule| schedule.to_string()),
+        None => None,
+    };
     sqlx::query(
-        "UPDATE app_users SET training_plan = ?, training_goals = ?, plan_start_date = ? WHERE id = ?",
+        "UPDATE app_users SET training_plan = ?, training_goals = ?, plan_start_date = ?, plan_schedule_json = ? WHERE id = ?",
     )
-        .bind(clean_optional(payload.training_plan))
+        .bind(training_plan)
         .bind(clean_optional(payload.training_goals))
         .bind(clean_optional(payload.plan_start_date))
+        .bind(plan_schedule_json)
         .bind(user.id)
         .execute(&state.db)
         .await?;
@@ -186,7 +225,7 @@ async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<UserIdent
         .ok_or(AppError::Unauthorized)?;
     let user = sqlx::query_as::<_, UserIdentity>(
         r#"
-        SELECT u.id, u.username, u.training_plan, u.training_goals, u.plan_start_date
+        SELECT u.id, u.username, u.training_plan, u.training_goals, u.plan_start_date, u.plan_schedule_json
         FROM app_sessions s
         JOIN app_users u ON u.id = s.user_id
         WHERE s.id = ? AND s.expires_at > datetime('now')
@@ -229,4 +268,5 @@ pub struct UserIdentity {
     pub training_plan: Option<String>,
     pub training_goals: Option<String>,
     pub plan_start_date: Option<String>,
+    pub plan_schedule_json: Option<String>,
 }
