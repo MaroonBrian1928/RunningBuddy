@@ -122,7 +122,7 @@ async fn openai_structure_plan(
     plan_text: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let api_key = state.config.openai_api_key.as_ref().unwrap();
-    let payload = json!({
+    let mut payload = json!({
         "model": state.config.llm_model,
         "response_format": {
             "type": "json_schema",
@@ -137,6 +137,7 @@ async fn openai_structure_plan(
             { "role": "user", "content": plan_text }
         ]
     });
+    state.config.apply_reasoning_effort(&mut payload);
     let response: serde_json::Value = state
         .http
         .post(format!(
@@ -287,7 +288,13 @@ fn workout_kind(day: &serde_json::Value) -> &'static str {
     match day.get("workout_type").and_then(|value| value.as_str()) {
         Some("rest") => "rest",
         Some("easy" | "long" | "tempo" | "intervals" | "race") => "run",
-        _ if day.get("run_miles").and_then(|value| value.as_f64()).is_some() => "run",
+        _ if day
+            .get("run_miles")
+            .and_then(|value| value.as_f64())
+            .is_some() =>
+        {
+            "run"
+        }
         _ => "flex",
     }
 }
@@ -304,7 +311,9 @@ fn activity_candidates(activities: &[serde_json::Value]) -> Vec<Candidate> {
                 is_run: sport_type
                     .map(|sport| sport.to_ascii_lowercase().contains("run"))
                     .unwrap_or(false),
-                distance_miles: activity.get("distance_miles").and_then(|value| value.as_f64()),
+                distance_miles: activity
+                    .get("distance_miles")
+                    .and_then(|value| value.as_f64()),
                 claimed: false,
                 summary: json!({
                     "name": activity.get("name"),
@@ -374,7 +383,11 @@ fn candidate_rank(
     };
     (
         (candidate.date - date).num_days().abs(),
-        if kind_filter == "flex" && candidate.is_run { 1 } else { 0 },
+        if kind_filter == "flex" && candidate.is_run {
+            1
+        } else {
+            0
+        },
         distance_gap,
     )
 }
@@ -428,8 +441,7 @@ mod tests {
     #[test]
     fn evaluate_schedule_marks_today_pending_not_missed() {
         let today = NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
-        let evaluation =
-            evaluate_schedule(&sample_schedule(), "2026-06-15", &[], today).unwrap();
+        let evaluation = evaluate_schedule(&sample_schedule(), "2026-06-15", &[], today).unwrap();
         let days = evaluation["days"].as_array().unwrap();
         assert_eq!(days[0]["date"], "2026-07-03");
         assert_eq!(days[0]["status"], "pending_today");
@@ -476,8 +488,7 @@ mod tests {
             "moving_time_seconds": 2700
         })];
         let today = NaiveDate::from_ymd_opt(2026, 7, 4).unwrap();
-        let evaluation =
-            evaluate_schedule(&schedule, "2026-06-29", &activities, today).unwrap();
+        let evaluation = evaluate_schedule(&schedule, "2026-06-29", &activities, today).unwrap();
         let days = evaluation["days"].as_array().unwrap();
         // Saturday cross-train: its only candidate was claimed by the long
         // run, and the day is not over.
@@ -505,8 +516,7 @@ mod tests {
             "moving_time_seconds": 1700
         })];
         let today = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
-        let evaluation =
-            evaluate_schedule(&schedule, "2026-06-29", &activities, today).unwrap();
+        let evaluation = evaluate_schedule(&schedule, "2026-06-29", &activities, today).unwrap();
         let days = evaluation["days"].as_array().unwrap();
         assert_eq!(days[0]["date"], "2026-06-30");
         assert_eq!(days[0]["status"], "completed_late");

@@ -101,10 +101,11 @@ pub async fn login(
     headers.insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+            "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
             state.config.session_cookie,
             session_id,
-            Duration::days(30).num_seconds()
+            Duration::days(30).num_seconds(),
+            secure_cookie_suffix(&state.config)
         ))
         .map_err(|err| AppError::BadRequest(err.to_string()))?,
     );
@@ -144,8 +145,9 @@ pub async fn logout(
     response_headers.insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
-            state.config.session_cookie
+            "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+            state.config.session_cookie,
+            secure_cookie_suffix(&state.config)
         ))
         .map_err(|err| AppError::BadRequest(err.to_string()))?,
     );
@@ -154,7 +156,11 @@ pub async fn logout(
 }
 
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>> {
-    let user = current_user(&state, &headers).await.ok();
+    let user = match current_user(&state, &headers).await {
+        Ok(user) => Some(user),
+        Err(AppError::Unauthorized) => None,
+        Err(error) => return Err(error),
+    };
     let mut auto_sync_started = false;
     if let Some(user) = user.as_ref() {
         // A visit is the trigger for the once-a-day catch-up sync. Never let a
@@ -228,7 +234,7 @@ async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<UserIdent
         SELECT u.id, u.username, u.training_plan, u.training_goals, u.plan_start_date, u.plan_schedule_json
         FROM app_sessions s
         JOIN app_users u ON u.id = s.user_id
-        WHERE s.id = ? AND s.expires_at > datetime('now')
+        WHERE s.id = ? AND datetime(s.expires_at) > datetime('now')
         "#,
     )
     .bind(session_id)
@@ -269,4 +275,154 @@ pub struct UserIdentity {
     pub training_goals: Option<String>,
     pub plan_start_date: Option<String>,
     pub plan_schedule_json: Option<String>,
+}
+
+fn secure_cookie_suffix(config: &Config) -> &'static str {
+    if url::Url::parse(&config.public_url).is_ok_and(|url| url.scheme() == "https") {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn state() -> AppState {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let mut config = Config::from_env();
+        config.admin_username = "runner".into();
+        config.admin_password = "test-password".into();
+        config.public_url = "https://running.example".into();
+        ensure_admin_user(&db, &config).await.unwrap();
+        AppState {
+            config,
+            db,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_rfc3339_session_on_same_day() {
+        let state = state().await;
+        let user_id: i64 = sqlx::query_scalar("SELECT id FROM app_users WHERE username = 'runner'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        // UTC midnight is already expired today, but RFC3339's 'T' sorts after a space.
+        let expired = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .to_rfc3339();
+        sqlx::query("INSERT INTO app_sessions (id, user_id, expires_at) VALUES ('expired', ?, ?)")
+            .bind(user_id)
+            .bind(expired)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{}=expired", state.config.session_cookie)
+                .parse()
+                .unwrap(),
+        );
+        assert!(matches!(
+            require_user(&state, &headers).await,
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn login_cookie_authenticates_and_logout_revokes_session() {
+        let state = state().await;
+        let response = login(
+            State(state.clone()),
+            Json(LoginRequest {
+                username: "runner".into(),
+                password: "test-password".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.contains("; Secure"));
+        assert!(cookie.contains("HttpOnly; SameSite=Lax"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            cookie.split(';').next().unwrap().parse().unwrap(),
+        );
+        assert_eq!(
+            require_user(&state, &headers).await.unwrap().username,
+            "runner"
+        );
+        let response = logout(State(state.clone()), headers.clone())
+            .await
+            .unwrap()
+            .into_response();
+        assert!(response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0; Secure"));
+        assert!(matches!(
+            require_user(&state, &headers).await,
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn incorrect_password_does_not_create_session() {
+        let state = state().await;
+        assert!(matches!(
+            login(
+                State(state.clone()),
+                Json(LoginRequest {
+                    username: "runner".into(),
+                    password: "incorrect".into(),
+                })
+            )
+            .await,
+            Err(AppError::Unauthorized)
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM app_sessions")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn session_check_propagates_database_failure() {
+        let state = state().await;
+        state.db.close().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("{}=session", state.config.session_cookie)
+                .parse()
+                .unwrap(),
+        );
+        assert!(matches!(
+            me(State(state), headers).await,
+            Err(AppError::Sqlx(_))
+        ));
+    }
+
+    #[test]
+    fn local_http_does_not_require_secure_cookie() {
+        let mut config = Config::from_env();
+        config.public_url = "http://127.0.0.1:3000".into();
+        assert_eq!(secure_cookie_suffix(&config), "");
+    }
 }

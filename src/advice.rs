@@ -1,7 +1,10 @@
 use crate::{
     auth,
     error::{AppError, Result},
-    models::{TrainingAdviceBody, TrainingAdviceResponse, TrainingAdviceRow},
+    models::{
+        AdviceCalendarEntry, AdviceChatTurn, AdviceDayResponse, TrainingAdviceBody,
+        TrainingAdviceResponse, TrainingAdviceRow,
+    },
     AppState,
 };
 use axum::{
@@ -29,12 +32,13 @@ pub struct AdviceChatMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct AdviceChatRequest {
-    messages: Vec<AdviceChatMessage>,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AdviceChatResponse {
     message: String,
+    chat: Vec<AdviceChatTurn>,
 }
 
 struct TrainingProfile<'a> {
@@ -48,7 +52,8 @@ fn schedule_evaluation(
     user: &auth::UserIdentity,
     activities: &[serde_json::Value],
 ) -> Option<serde_json::Value> {
-    let schedule = serde_json::from_str::<serde_json::Value>(user.plan_schedule_json.as_deref()?).ok()?;
+    let schedule =
+        serde_json::from_str::<serde_json::Value>(user.plan_schedule_json.as_deref()?).ok()?;
     crate::plan::evaluate_schedule(
         &schedule,
         user.plan_start_date.as_deref()?,
@@ -110,12 +115,40 @@ struct TargetActivityRow {
     altitude_json: Option<String>,
 }
 
+/// Runs `work` on its own task so a client disconnect cannot cancel it. Axum
+/// drops a handler's future the moment the connection goes away, which would
+/// otherwise abort an in-flight LLM call and lose the result it was about to
+/// persist; a spawned task keeps running to completion regardless.
+async fn detached<F, T>(work: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(work).await {
+        Ok(result) => result,
+        Err(err) => Err(AppError::Anyhow(anyhow::anyhow!(
+            "advice task failed: {err}"
+        ))),
+    }
+}
+
 pub async fn generate(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<GenerateAdviceRequest>,
 ) -> Result<Json<TrainingAdviceResponse>> {
     let user = auth::require_user(&state, &headers).await?;
+    // Detached for the same reason as `chat`: a generation that has already
+    // cost an LLM call should land in the database even if the tab is closed
+    // before the response arrives.
+    detached(async move { run_generate(state, user, payload).await }).await
+}
+
+async fn run_generate(
+    state: AppState,
+    user: auth::UserIdentity,
+    payload: GenerateAdviceRequest,
+) -> Result<Json<TrainingAdviceResponse>> {
     let input_window_days = payload.input_window_days.clamp(1, 365);
     let window = recent_activities(&state, input_window_days).await?;
     let target_activity = match payload.activity_id {
@@ -180,6 +213,57 @@ pub async fn detail(
     Ok(Json(row.into_response()))
 }
 
+/// Every day that has a stored training overview, newest first. Drives the
+/// calendar picker in the UI.
+pub async fn calendar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AdviceCalendarEntry>>> {
+    auth::require_user(&state, &headers).await?;
+    let rows = sqlx::query_as::<_, AdviceCalendarEntry>(
+        r#"
+        SELECT id, advice_date, created_at
+        FROM training_advice
+        WHERE activity_id IS NULL AND advice_date IS NOT NULL
+        ORDER BY advice_date DESC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(rows))
+}
+
+/// The overview stored for one calendar day, together with the follow-up
+/// conversation saved against it.
+pub async fn day(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(date): Path<String>,
+) -> Result<Json<AdviceDayResponse>> {
+    auth::require_user(&state, &headers).await?;
+    let row = sqlx::query_as::<_, TrainingAdviceRow>(
+        "SELECT * FROM training_advice WHERE activity_id IS NULL AND advice_date = ?",
+    )
+    .bind(&date)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let chat = chat_turns(&state, row.id).await?;
+    Ok(Json(AdviceDayResponse {
+        advice: row.into_response(),
+        chat,
+    }))
+}
+
+pub async fn chat_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<AdviceChatTurn>>> {
+    auth::require_user(&state, &headers).await?;
+    Ok(Json(chat_turns(&state, id).await?))
+}
+
 pub async fn chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -187,6 +271,22 @@ pub async fn chat(
     Json(payload): Json<AdviceChatRequest>,
 ) -> Result<Json<AdviceChatResponse>> {
     let user = auth::require_user(&state, &headers).await?;
+    let question = payload.message.trim().to_string();
+    if question.is_empty() {
+        return Err(AppError::BadRequest("message must not be empty".into()));
+    }
+    // Detached so the answer is still stored when the browser goes away: axum
+    // drops the handler future as soon as the client disconnects, which would
+    // otherwise cancel the LLM call and the writes below mid-flight.
+    detached(async move { run_chat_turn(state, user, id, question).await }).await
+}
+
+async fn run_chat_turn(
+    state: AppState,
+    user: auth::UserIdentity,
+    id: i64,
+    question: String,
+) -> Result<Json<AdviceChatResponse>> {
     let row = sqlx::query_as::<_, TrainingAdviceRow>("SELECT * FROM training_advice WHERE id = ?")
         .bind(id)
         .fetch_optional(&state.db)
@@ -200,9 +300,49 @@ pub async fn chat(
         plan_start_date: user.plan_start_date.as_deref(),
         schedule_evaluation: schedule_evaluation(&user, &window.activities),
     };
-    let message =
-        request_advice_chat(&state, &advice.body, &payload.messages, &window, &profile).await?;
-    Ok(Json(AdviceChatResponse { message }))
+    // The stored thread is the conversation: the client sends only the new
+    // question so a reload of an older day keeps its history intact.
+    let mut messages: Vec<AdviceChatMessage> = chat_turns(&state, id)
+        .await?
+        .into_iter()
+        .map(|turn| AdviceChatMessage {
+            role: turn.role,
+            content: turn.content,
+        })
+        .collect();
+    messages.push(AdviceChatMessage {
+        role: "user".into(),
+        content: question.clone(),
+    });
+    let message = request_advice_chat(&state, &advice.body, &messages, &window, &profile).await?;
+    insert_chat_turn(&state, id, "user", &question).await?;
+    insert_chat_turn(&state, id, "assistant", &message).await?;
+    let chat = chat_turns(&state, id).await?;
+    Ok(Json(AdviceChatResponse { message, chat }))
+}
+
+async fn chat_turns(state: &AppState, advice_id: i64) -> Result<Vec<AdviceChatTurn>> {
+    Ok(sqlx::query_as::<_, AdviceChatTurn>(
+        "SELECT id, role, content, created_at FROM advice_chat_messages WHERE advice_id = ? ORDER BY id",
+    )
+    .bind(advice_id)
+    .fetch_all(&state.db)
+    .await?)
+}
+
+async fn insert_chat_turn(
+    state: &AppState,
+    advice_id: i64,
+    role: &str,
+    content: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO advice_chat_messages (advice_id, role, content) VALUES (?, ?, ?)")
+        .bind(advice_id)
+        .bind(role)
+        .bind(content)
+        .execute(&state.db)
+        .await?;
+    Ok(())
 }
 
 struct ActivityWindow {
@@ -239,7 +379,8 @@ fn weekly_training_summary(rows: &[AdviceActivityRow]) -> Vec<serde_json::Value>
     let mut weeks: std::collections::BTreeMap<NaiveDate, (f64, i64, i64, i64)> =
         std::collections::BTreeMap::new();
     for row in rows {
-        let Some(date) = activity_local_date(row.start_date_local.as_deref(), row.start_date.as_deref())
+        let Some(date) =
+            activity_local_date(row.start_date_local.as_deref(), row.start_date.as_deref())
         else {
             continue;
         };
@@ -256,15 +397,17 @@ fn weekly_training_summary(rows: &[AdviceActivityRow]) -> Vec<serde_json::Value>
     weeks
         .iter()
         .rev()
-        .map(|(week_start, (run_miles, run_count, other_count, moving_seconds))| {
-            json!({
-                "week_starting_monday": week_start.to_string(),
-                "run_miles": (run_miles * 10.0).round() / 10.0,
-                "run_count": run_count,
-                "other_activity_count": other_count,
-                "total_moving_time_seconds": moving_seconds,
-            })
-        })
+        .map(
+            |(week_start, (run_miles, run_count, other_count, moving_seconds))| {
+                json!({
+                    "week_starting_monday": week_start.to_string(),
+                    "run_miles": (run_miles * 10.0).round() / 10.0,
+                    "run_count": run_count,
+                    "other_activity_count": other_count,
+                    "total_moving_time_seconds": moving_seconds,
+                })
+            },
+        )
         .collect()
 }
 
@@ -377,7 +520,8 @@ fn compact_activity_gear(activity: Option<&serde_json::Value>) -> Option<serde_j
 
 fn activity_summary(row: &AdviceActivityRow) -> serde_json::Value {
     let raw = serde_json::from_str::<serde_json::Value>(&row.raw_activity_json).ok();
-    let local_date = activity_local_date(row.start_date_local.as_deref(), row.start_date.as_deref());
+    let local_date =
+        activity_local_date(row.start_date_local.as_deref(), row.start_date.as_deref());
     json!({
         "id": row.id,
         "strava_activity_id": row.strava_activity_id,
@@ -412,7 +556,8 @@ fn activity_summary(row: &AdviceActivityRow) -> serde_json::Value {
 
 fn target_activity_summary(row: &TargetActivityRow) -> serde_json::Value {
     let raw = serde_json::from_str::<serde_json::Value>(&row.raw_activity_json).ok();
-    let local_date = activity_local_date(row.start_date_local.as_deref(), row.start_date.as_deref());
+    let local_date =
+        activity_local_date(row.start_date_local.as_deref(), row.start_date.as_deref());
     json!({
         "id": row.id,
         "strava_activity_id": row.strava_activity_id,
@@ -501,7 +646,11 @@ fn stream_quarter_stats(heartrate: &[f64], velocity: &[f64]) -> serde_json::Valu
     json!((0..4)
         .map(|index| {
             let pace = quarter(velocity, index).and_then(|chunk| {
-                let positive = chunk.iter().copied().filter(|value| *value > 0.0).collect::<Vec<_>>();
+                let positive = chunk
+                    .iter()
+                    .copied()
+                    .filter(|value| *value > 0.0)
+                    .collect::<Vec<_>>();
                 (!positive.is_empty()).then(|| 1609.344 / avg(&positive))
             });
             json!({
@@ -691,7 +840,7 @@ async fn openai_advice(
     user_content: &serde_json::Value,
 ) -> Result<TrainingAdviceBody> {
     let api_key = state.config.openai_api_key.as_ref().unwrap();
-    let payload = json!({
+    let mut payload = json!({
         "model": state.config.llm_model,
         "response_format": {
             "type": "json_schema",
@@ -706,6 +855,7 @@ async fn openai_advice(
             { "role": "user", "content": user_content.to_string() }
         ]
     });
+    state.config.apply_reasoning_effort(&mut payload);
     let response_result = state
         .http
         .post(format!(
@@ -838,9 +988,12 @@ async fn request_advice_chat(
     }
 }
 
+/// The unchanging context for a chat thread. The conversation itself is sent as
+/// real message turns rather than a field in here: this JSON is identical on
+/// every follow-up, so it stays a stable cacheable prefix instead of shifting
+/// each time a message is appended.
 fn advice_chat_payload(
     advice: &TrainingAdviceBody,
-    messages: &[AdviceChatMessage],
     window: &ActivityWindow,
     profile: &TrainingProfile<'_>,
 ) -> serde_json::Value {
@@ -859,8 +1012,13 @@ fn advice_chat_payload(
         "activities": window.activities,
         "weekly_training_summary": window.weekly_summary,
         "saved_advice": advice_chat_context(advice),
-        "conversation": messages,
     })
+}
+
+/// Roles are whatever the client sent; anything that isn't an assistant turn is
+/// treated as coming from the runner.
+fn is_assistant_turn(message: &AdviceChatMessage) -> bool {
+    message.role == "assistant"
 }
 
 async fn openai_advice_chat(
@@ -871,14 +1029,24 @@ async fn openai_advice_chat(
     profile: &TrainingProfile<'_>,
 ) -> Result<String> {
     let api_key = state.config.openai_api_key.as_ref().unwrap();
-    let chat_messages = json!([
-        { "role": "system", "content": advice_chat_system_prompt() },
-        { "role": "user", "content": advice_chat_payload(advice, messages, window, profile).to_string() }
-    ]);
-    let payload = json!({
+    let mut chat_messages = vec![
+        json!({ "role": "system", "content": advice_chat_system_prompt() }),
+        json!({
+            "role": "user",
+            "content": advice_chat_payload(advice, window, profile).to_string()
+        }),
+    ];
+    chat_messages.extend(messages.iter().map(|message| {
+        json!({
+            "role": if is_assistant_turn(message) { "assistant" } else { "user" },
+            "content": message.content,
+        })
+    }));
+    let mut payload = json!({
         "model": state.config.llm_model,
         "messages": chat_messages
     });
+    state.config.apply_reasoning_effort(&mut payload);
     let response_json: serde_json::Value = state
         .http
         .post(format!(
@@ -906,14 +1074,28 @@ async fn gemini_advice_chat(
     profile: &TrainingProfile<'_>,
 ) -> Result<String> {
     let api_key = state.config.gemini_api_key.as_ref().unwrap();
+    let context = advice_chat_payload(advice, window, profile).to_string();
+    // Gemini wants alternating user/model turns, so the context rides along with
+    // the first user turn rather than becoming an extra leading user entry.
+    let mut contents: Vec<serde_json::Value> = Vec::with_capacity(messages.len() + 1);
+    for (index, message) in messages.iter().enumerate() {
+        let assistant = is_assistant_turn(message);
+        let text = if index == 0 && !assistant {
+            format!("{context}\n\n{}", message.content)
+        } else {
+            message.content.clone()
+        };
+        contents.push(json!({
+            "role": if assistant { "model" } else { "user" },
+            "parts": [{ "text": text }],
+        }));
+    }
+    if messages.first().map(is_assistant_turn).unwrap_or(true) {
+        contents.insert(0, json!({ "role": "user", "parts": [{ "text": context }] }));
+    }
     let payload = json!({
-        "contents": [{
-            "parts": [{ "text": format!(
-                "{}\n\n{}",
-                advice_chat_system_prompt(),
-                advice_chat_payload(advice, messages, window, profile)
-            ) }]
-        }]
+        "systemInstruction": { "parts": [{ "text": advice_chat_system_prompt() }] },
+        "contents": contents,
     });
     let response_json: serde_json::Value = state
         .http
@@ -967,13 +1149,31 @@ async fn persist_advice(
     body: &TrainingAdviceBody,
     request_payload: Option<&serde_json::Value>,
 ) -> Result<TrainingAdviceResponse> {
+    // Overviews are keyed by local day: regenerating on a day that already has
+    // one rewrites that row in place, so at most one is stored per day and the
+    // follow-up conversation attached to it survives.
+    let advice_date = Local::now().date_naive().to_string();
     let row = sqlx::query_as::<_, TrainingAdviceRow>(
         r#"
         INSERT INTO training_advice
             (activity_id, provider, model, input_window_days, summary, load_observations_json,
              risks_json, last_7_days_json, next_7_days_json, recovery_notes, confidence,
-             raw_response_json, request_payload_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             raw_response_json, request_payload_json, advice_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(advice_date) WHERE activity_id IS NULL DO UPDATE SET
+            provider = excluded.provider,
+            model = excluded.model,
+            input_window_days = excluded.input_window_days,
+            summary = excluded.summary,
+            load_observations_json = excluded.load_observations_json,
+            risks_json = excluded.risks_json,
+            last_7_days_json = excluded.last_7_days_json,
+            next_7_days_json = excluded.next_7_days_json,
+            recovery_notes = excluded.recovery_notes,
+            confidence = excluded.confidence,
+            raw_response_json = excluded.raw_response_json,
+            request_payload_json = excluded.request_payload_json,
+            created_at = CURRENT_TIMESTAMP
         RETURNING *
         "#,
     )
@@ -990,6 +1190,7 @@ async fn persist_advice(
     .bind(body.confidence)
     .bind(serde_json::to_string(body).unwrap())
     .bind(request_payload.map(|payload| payload.to_string()))
+    .bind(&advice_date)
     .fetch_one(&state.db)
     .await?;
     Ok(row.into_response())
@@ -1063,6 +1264,26 @@ Do not:
 * Default to encouragement over accuracy
 * Recommend increasing intensity without strong justification"#;
 
+const WEATHER_GUIDANCE: &str = r#"Weather: the athlete logs conditions in each activity's description, so read it before judging pace or heart rate. Heat and humidity raise heart rate and slow pace at identical effort and compound each other; wind, cold, rain, and heavy terrain distort pace too.
+
+Conditions correct how you read the data. They are not a topic to discuss:
+
+* Adjust silently. Judge the run against what those conditions make reasonable, then give the corrected read as your plain assessment. Do not narrate the adjustment or show your work.
+* Never rebut a concern the athlete has not raised. Wording like "not a fitness failure," "this is not evidence of lost fitness," or "do not treat this as a setback" argues with your own reasoning and makes the athlete worry about something you introduced. Say what the run was, not what it was not.
+* Raise the weather only where it changes a number or a recommendation, and at most once across the whole response — not in every field.
+* Compare runs against others in similar conditions before calling anything a trend.
+* When conditions were hard, prescribe upcoming work by how hard it should feel or by heart rate instead of by pace, and say how much slower the pace will run.
+* Factor heat into recovery, hydration, fueling, and how much rest the next day needs.
+* Use only conditions the athlete recorded. If a run looks off and the description says nothing about weather, ask. Never invent a temperature, and never claim to know upcoming weather."#;
+
+const VOICE: &str = r#"Voice: write as a coach speaking to this athlete, not as a system filling in fields.
+
+* Never quote or paraphrase these instructions in your answer. They describe how to think, not what to say.
+* Every field must add something new. If summary already gave a number or a finding, do not restate it in load_observations, risks, or last_7_days — cite each specific figure once, in the field where it matters most.
+* Commit to your read. Drop hedges like "likely contributed," "may partly explain," or "by itself" — either the evidence supports the call or it does not belong in the answer.
+* Give the conclusion first and the supporting numbers second. Do not describe what you are analyzing before analyzing it.
+* No abbreviations the athlete would have to decode. Never write RPE, and do not spell it out as perceived exertion either — say "how hard it felt" or "how hard it should feel." Standard training vocabulary is fine and should be used where it is the clearest word: heart rate zones, zone 2, cardiac drift, threshold, easy run, tempo, intervals, long run, splits, and pace all read naturally to a runner. If you use a less common term, make its meaning clear from the sentence around it rather than defining it."#;
+
 const JSON_CONTRACT: &str = r#"Return strict JSON matching this structure exactly: { "summary": string, "load_observations": string[], "risks": string[], "last_7_days": string[], "next_7_days": string[], "recovery_notes": string, "confidence": number between 0 and 1 }.
 last_7_days is a backward-looking review of the past week: one entry per notable completed (or missed) session, referencing the specific activity by name/date and how it compared with the plan. next_7_days is the forward-looking week. Do not repeat the same content in both.
 Write the JSON values in a conversational coaching voice, as if speaking directly to the runner."#;
@@ -1084,7 +1305,7 @@ Your job is to review target_activity. The plan and recent activities are contex
 
 When responding, apply these rules only when they help explain target_activity:
 
-* Translate what happened in target_activity into actionable pacing, effort, heart rate, or RPE guidance
+* Translate what happened in target_activity into actionable guidance on pace, effort, heart rate, or how hard the run should feel
 * Explain what role this workout most likely played (easy run, tempo, intervals, long run, recovery, etc.) and whether the execution matched that purpose
 * Suggest modifications to upcoming workouts only when this activity justifies them, and explain why
 * Flag overtraining risk, poor progression, or likely injury traps that this activity reveals
@@ -1103,8 +1324,14 @@ Use athlete_profile, training_profile, activities, weekly_training_summary, and 
 * Do not fill missing activity details with broader plan commentary.
 * If target_activity lacks key data, say what is missing and give the narrowest useful activity-specific guidance rather than expanding into generic plan advice.
 
+{weather}
+
+{voice}
+
 {contract}"#,
             persona = COACH_PERSONA,
+            weather = WEATHER_GUIDANCE,
+            voice = VOICE,
             contract = JSON_CONTRACT,
         )
     }).as_str()
@@ -1126,7 +1353,7 @@ When responding:
 * When schedule_evaluation is absent, only describe a planned workout as skipped or missed when no activity exists on that local calendar date AND the date is fully in the past. Never call today's planned workout skipped: the day is not over and activities can sync late. If an activity on the right day roughly matches the planned distance or effort, treat the workout as completed, not missed.
 * Use weekly_training_summary for weekly mileage totals and activity counts rather than recomputing them from raw activities.
 * First understand the full training plan, goal race/event, timeline, current fitness level, injury history, available training days, and constraints (work, family, travel, equipment, terrain, weather)
-* Help translate workouts into actionable pacing, effort, heart rate, or RPE guidance
+* Help translate workouts into actionable guidance on pace, effort, heart rate, or how hard the run should feel
 * Explain the purpose of each workout (easy run, tempo, intervals, long run, recovery, deload, etc.)
 * Identify if the plan is too aggressive, too conservative, or internally inconsistent
 * Suggest modifications only when justified, and explain why
@@ -1145,18 +1372,24 @@ Use current_date, athlete_profile, training_profile, activities, and weekly_trai
 
 If the training plan, goal race, timeline, current fitness, injury history, available days, or constraints are missing, include concise targeted questions inside the relevant JSON fields instead of inventing details.
 
+{weather}
+
+{voice}
+
 {contract}"#,
             persona = COACH_PERSONA,
+            weather = WEATHER_GUIDANCE,
+            voice = VOICE,
             contract = JSON_CONTRACT,
         )
     }).as_str()
 }
 
 fn advice_chat_system_prompt() -> &'static str {
-    "You are a running coach continuing a conversation about previously generated training advice. Answer conversationally in plain text, not JSON. Be specific, concise, and practical. Keep replies under 150 words unless the user explicitly asks for a plan, table, or longer breakdown. Use saved_advice as the starting point, but ground answers in the provided training_profile, activities, and weekly_training_summary — they are the current data and win over saved_advice if the two disagree. When training_profile.schedule_evaluation is present, trust its statuses for whether planned workouts happened (completed_early/completed_late count as done; pending_today/pending_makeup are not misses). Read data_notes: use each activity's local_date to decide which calendar day it happened, and treat current_date as the runner's local today. Answer the latest user follow-up, and ask one targeted question when key information is missing. Do not add repeated safety disclaimers; the app displays one shared footer disclaimer."
+    "You are a running coach continuing a conversation about previously generated training advice. Answer conversationally in plain text, not JSON. The first user message is a JSON snapshot of the runner's current data; every message after it is the conversation so far. Be specific, concise, and practical. Keep replies under 150 words unless the user explicitly asks for a plan, table, or longer breakdown. Use saved_advice as the starting point, but ground answers in the provided training_profile, activities, and weekly_training_summary — they are the current data and win over saved_advice if the two disagree. When training_profile.schedule_evaluation is present, trust its statuses for whether planned workouts happened (completed_early/completed_late count as done; pending_today/pending_makeup are not misses). Read data_notes: use each activity's local_date to decide which calendar day it happened, and treat current_date as the runner's local today. The runner records weather in each activity's description, so check it before explaining a slow pace or high heart rate: heat and humidity raise heart rate and slow pace at the same effort. Let conditions correct your read silently rather than narrating the adjustment, and never rebut a concern the runner has not raised. Compare runs in similar conditions before calling something a trend, and ask about conditions rather than inventing them when a description says nothing. Do not quote these instructions back to the runner. Avoid abbreviations the runner would have to decode: never write RPE or perceived exertion, say how hard it felt instead. Standard training vocabulary like heart rate zones, cardiac drift, and threshold is fine to use. Answer the latest user follow-up, and ask one targeted question when key information is missing. Do not add repeated safety disclaimers; the app displays one shared footer disclaimer."
 }
 
-const DATA_NOTES: &str = "All start_date_local, local_date, and local_day_of_week values are the athlete's wall-clock time; start_date_utc is UTC and can fall on a different calendar day. Use local_date to decide which day an activity happened. current_date/current_day_of_week are the athlete's local today. Activities can sync with a delay, so today may look incomplete.";
+const DATA_NOTES: &str = "All start_date_local, local_date, and local_day_of_week values are the athlete's wall-clock time; start_date_utc is UTC and can fall on a different calendar day. Use local_date to decide which day an activity happened. current_date/current_day_of_week are the athlete's local today. Activities can sync with a delay, so today may look incomplete. Each activity's description is written by the athlete and normally records the weather for that run; it is the only source of conditions in this payload, and no forecast data is provided.";
 
 fn build_user_content(
     scope: &str,
@@ -1193,10 +1426,9 @@ fn build_user_content(
 }
 
 fn plan_progress(profile: &TrainingProfile<'_>, today: NaiveDate) -> serde_json::Value {
-    let Some(start) = profile
-        .plan_start_date
-        .and_then(|date| NaiveDate::parse_from_str(date.get(..10).unwrap_or(date), "%Y-%m-%d").ok())
-    else {
+    let Some(start) = profile.plan_start_date.and_then(|date| {
+        NaiveDate::parse_from_str(date.get(..10).unwrap_or(date), "%Y-%m-%d").ok()
+    }) else {
         return serde_json::Value::Null;
     };
     let days = (today - start).num_days();
@@ -1269,6 +1501,54 @@ mod tests {
     fn scoped_advice_prompts_require_json_response() {
         assert!(activity_review_system_prompt().contains("Return strict JSON"));
         assert!(training_overview_system_prompt().contains("Return strict JSON"));
+    }
+
+    #[test]
+    fn scoped_advice_prompts_point_weather_at_the_description_field() {
+        for prompt in [
+            activity_review_system_prompt(),
+            training_overview_system_prompt(),
+        ] {
+            assert!(prompt.contains("Weather:"));
+            assert!(prompt.contains("description"));
+            assert!(prompt.contains("Voice:"));
+        }
+        assert!(advice_chat_system_prompt().contains("weather"));
+    }
+
+    #[test]
+    fn chat_context_is_identical_as_the_conversation_grows() {
+        let advice = local_fallback_advice(28, false);
+        let window = ActivityWindow {
+            activities: vec![json!({ "id": 1, "name": "Morning Run" })],
+            weekly_summary: vec![json!({ "run_miles": 12.0 })],
+        };
+        let profile = TrainingProfile {
+            plan: Some("easy week"),
+            goals: None,
+            plan_start_date: None,
+            schedule_evaluation: None,
+        };
+
+        // The context no longer carries the conversation, so it is byte-identical
+        // between turns and stays a cacheable prefix.
+        let first = advice_chat_payload(&advice, &window, &profile).to_string();
+        let second = advice_chat_payload(&advice, &window, &profile).to_string();
+        assert_eq!(first, second);
+        assert!(!first.contains("conversation"));
+    }
+
+    #[test]
+    fn prompts_ban_rpe_rather_than_using_it() {
+        for prompt in [
+            activity_review_system_prompt(),
+            training_overview_system_prompt(),
+            advice_chat_system_prompt(),
+        ] {
+            // The only mention allowed is the instruction not to say it.
+            assert_eq!(prompt.matches("RPE").count(), 1);
+            assert!(prompt.contains("never write RPE") || prompt.contains("Never write RPE"));
+        }
     }
 
     #[test]

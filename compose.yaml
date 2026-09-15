@@ -5,30 +5,21 @@ services:
       args:
         VITE_MAP_STYLE_URL: "${VITE_MAP_STYLE_URL:-}"
     image: runningbuddy:local
-    restart: unless-stopped
     ports:
       - "${RUNNINGBUDDY_PORT:-7317}:3000"
+    # Everything user-configurable comes straight from .env, so adding a new
+    # setting only means adding it there. Blank entries are passed through as
+    # empty strings, which Config::from_env treats as unset.
+    env_file:
+      - path: .env
+        required: false
+    # Container-specific values only. These override .env, which holds the
+    # host-side equivalents for running the binary directly.
     environment:
       TZ: "${TZ:-America/Chicago}"
       RUST_LOG: "info,runningbuddy=debug"
       RUNNINGBUDDY_BIND_ADDR: "0.0.0.0:3000"
-      # RUNNINGBUDDY_DATABASE_URL: "sqlite:///data/runningbuddy.db"
       RUNNINGBUDDY_DATABASE_URL: "sqlite:///data/runningbuddy.db?mode=rwc"
-      RUNNINGBUDDY_ADMIN_USERNAME: "${RUNNINGBUDDY_ADMIN_USERNAME:-admin}"
-      RUNNINGBUDDY_ADMIN_PASSWORD: "${RUNNINGBUDDY_ADMIN_PASSWORD:-change-me}"
-      RUNNINGBUDDY_SESSION_COOKIE: "${RUNNINGBUDDY_SESSION_COOKIE:-runningbuddy_session}"
-      RUNNINGBUDDY_PUBLIC_URL: "${RUNNINGBUDDY_PUBLIC_URL:-http://localhost:7317}"
-      STRAVA_CLIENT_ID: "${STRAVA_CLIENT_ID:-}"
-      STRAVA_CLIENT_SECRET: "${STRAVA_CLIENT_SECRET:-}"
-      STRAVA_ATHLETE_ID: "${STRAVA_ATHLETE_ID:-}"
-      STRAVA_VERIFY_TOKEN: "${STRAVA_VERIFY_TOKEN:-change-me}"
-      STRAVA_BACKFILL_DAYS: "${STRAVA_BACKFILL_DAYS:-180}"
-      LLM_PROVIDER: "${LLM_PROVIDER:-openai}"
-      LLM_MODEL: "${LLM_MODEL:-gpt-4.1-mini}"
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
-      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
-      GEMINI_BASE_URL: "${GEMINI_BASE_URL:-https://generativelanguage.googleapis.com/v1beta}"
     volumes:
       - ./data:/data
     labels:

@@ -203,6 +203,27 @@ pub async fn bootstrap_env_token(state: &AppState) -> anyhow::Result<bool> {
         Err(err) => return Err(err.into()),
     };
 
+    let env_scopes = state
+        .config
+        .strava_token_scope
+        .clone()
+        .unwrap_or_else(|| "read,activity:read".to_string());
+
+    if let Some(strava_athlete_id) = athlete.get("id").and_then(|value| value.as_i64()) {
+        if let Some(stored) = stored_scopes(state, strava_athlete_id).await? {
+            // A refresh never widens scope, so a narrower env token would pin the
+            // grant to that scope until someone reconnects through OAuth.
+            if !scopes_cover(&env_scopes, &stored) {
+                tracing::warn!(
+                    env_scopes = %env_scopes,
+                    stored_scopes = %stored,
+                    "ignoring env Strava token: narrower than the stored grant"
+                );
+                return Ok(false);
+            }
+        }
+    }
+
     persist_athlete_and_token(
         state,
         athlete,
@@ -212,14 +233,33 @@ pub async fn bootstrap_env_token(state: &AppState) -> anyhow::Result<bool> {
             .config
             .strava_token_expires_at
             .unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600),
-        state
-            .config
-            .strava_token_scope
-            .clone()
-            .unwrap_or_else(|| "read,activity:read".to_string()),
+        env_scopes,
     )
     .await?;
     Ok(true)
+}
+
+async fn stored_scopes(state: &AppState, strava_athlete_id: i64) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query_as::<_, (String,)>(
+        r#"
+        SELECT t.scopes
+        FROM strava_tokens t
+        JOIN athletes a ON a.id = t.athlete_id
+        WHERE a.strava_athlete_id = ?
+        "#,
+    )
+    .bind(strava_athlete_id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(row.map(|(scopes,)| scopes))
+}
+
+/// Whether `candidate` grants everything `stored` already grants.
+fn scopes_cover(candidate: &str, stored: &str) -> bool {
+    let candidate = parse_scopes(candidate);
+    parse_scopes(stored)
+        .iter()
+        .all(|scope| candidate.contains(scope))
 }
 
 pub async fn webhook_challenge(
@@ -559,6 +599,19 @@ mod tests {
 
         assert_eq!(event.object_type, "activity");
         assert_eq!(event.updates["title"], "New title");
+    }
+
+    #[tokio::test]
+    async fn env_token_cannot_narrow_the_stored_grant() {
+        // test_state(true) stores athlete 99 with scope `read`.
+        let state = test_state(true).await;
+        assert!(scopes_cover("read,activity:read", "read"));
+        assert!(!scopes_cover("read", "read,activity:read"));
+        assert_eq!(
+            stored_scopes(&state, 99).await.unwrap().as_deref(),
+            Some("read")
+        );
+        assert!(stored_scopes(&state, 1234).await.unwrap().is_none());
     }
 
     #[test]

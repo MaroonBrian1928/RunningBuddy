@@ -69,6 +69,7 @@ pub struct TrainingAdviceRow {
     pub recovery_notes: String,
     pub confidence: f64,
     pub raw_response_json: String,
+    pub advice_date: Option<String>,
     pub created_at: String,
 }
 
@@ -80,7 +81,32 @@ pub struct TrainingAdviceResponse {
     pub model: String,
     pub input_window_days: i64,
     pub body: TrainingAdviceBody,
+    pub advice_date: Option<String>,
     pub created_at: String,
+}
+
+/// One day that has a stored training overview, for the calendar picker.
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdviceCalendarEntry {
+    pub id: i64,
+    pub advice_date: Option<String>,
+    pub created_at: String,
+}
+
+/// A persisted follow-up chat turn attached to a stored overview.
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdviceChatTurn {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// A stored overview plus the follow-up conversation saved with it.
+#[derive(Debug, Serialize)]
+pub struct AdviceDayResponse {
+    pub advice: TrainingAdviceResponse,
+    pub chat: Vec<AdviceChatTurn>,
 }
 
 impl TrainingAdviceRow {
@@ -101,6 +127,7 @@ impl TrainingAdviceRow {
                 recovery_notes: self.recovery_notes,
                 confidence: self.confidence,
             },
+            advice_date: self.advice_date,
             created_at: self.created_at,
         }
     }
