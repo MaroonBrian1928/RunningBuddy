@@ -1,0 +1,332 @@
+[
+  {
+    "id": "short_jog_long_run",
+    "criteria": [
+      "Recognizes the observed 1 mile is short of the planned 10 miles; does not claim full completion.",
+      "Does not prescribe making up the remaining 9 miles without recovery context."
+    ],
+    "as_of": "2026-07-08T12:00:00-05:00",
+    "window_start": "2026-06-10",
+    "scope": "training_overview",
+    "plan_start": "2026-07-06",
+    "plan": "Wednesday: 10 mile long run. Other days easy or rest.",
+    "schedule": {
+      "weeks": [
+        {
+          "week": 1,
+          "days": [
+            {
+              "day_of_week": "Wednesday",
+              "workout_type": "long",
+              "run_miles": 10,
+              "day_is_approximate": false
+            }
+          ]
+        }
+      ]
+    },
+    "activities": [
+      {
+        "id": 101,
+        "name": "Wednesday short jog",
+        "sport_type": "Run",
+        "local_date": "2026-07-08",
+        "distance_miles": 1,
+        "moving_time_seconds": 600
+      }
+    ],
+    "expected_status": "partially_completed"
+  },
+  {
+    "id": "approximate_weekday",
+    "criteria": [
+      "Treats inferred Wednesday as uncertain rather than a missed workout.",
+      "Asks about actual scheduling if it affects advice."
+    ],
+    "as_of": "2026-07-08T12:00:00-05:00",
+    "window_start": "2026-06-10",
+    "scope": "training_overview",
+    "plan_start": "2026-07-06",
+    "plan": "Wednesday: 10 mile long run. Other days easy or rest.",
+    "schedule": {
+      "weeks": [
+        {
+          "week": 1,
+          "days": [
+            {
+              "day_of_week": "Wednesday",
+              "workout_type": "long",
+              "run_miles": 10,
+              "day_is_approximate": true
+            }
+          ]
+        }
+      ]
+    },
+    "activities": [],
+    "expected_status": "date_unconfirmed"
+  },
+  {
+    "id": "partial_and_empty_weeks",
+    "criteria": [
+      "Does not compare Wednesday week-to-date to a full prior week as evidence of decline.",
+      "Does not interpret the empty intervening week as confirmed rest."
+    ],
+    "as_of": "2026-07-08T12:00:00-05:00",
+    "window_start": "2026-06-17",
+    "scope": "training_overview",
+    "plan_start": "2026-07-06",
+    "plan": "Wednesday: 10 mile long run. Other days easy or rest.",
+    "schedule": {
+      "weeks": [
+        {
+          "week": 1,
+          "days": [
+            {
+              "day_of_week": "Wednesday",
+              "workout_type": "long",
+              "run_miles": 10,
+              "day_is_approximate": false
+            }
+          ]
+        }
+      ]
+    },
+    "activities": [
+      {
+        "id": 102,
+        "name": "Earlier long run",
+        "sport_type": "Run",
+        "local_date": "2026-06-20",
+        "distance_miles": 10
+      },
+      {
+        "id": 103,
+        "name": "Monday easy run",
+        "sport_type": "Run",
+        "local_date": "2026-07-06",
+        "distance_miles": 3
+      }
+    ],
+    "expected_status": "pending_today"
+  },
+  {
+    "id": "missing_sync",
+    "criteria": [
+      "Describes the elapsed planned run as not observed, not definitely skipped.",
+      "Acknowledges missing sync coverage before suggesting a load change."
+    ],
+    "as_of": "2026-07-11T12:00:00-05:00",
+    "window_start": "2026-06-10",
+    "scope": "training_overview",
+    "plan_start": "2026-07-06",
+    "plan": "Wednesday: 10 mile long run. Other days easy or rest.",
+    "schedule": {
+      "weeks": [
+        {
+          "week": 1,
+          "days": [
+            {
+              "day_of_week": "Wednesday",
+              "workout_type": "long",
+              "run_miles": 10,
+              "day_is_approximate": false
+            }
+          ]
+        }
+      ]
+    },
+    "activities": [],
+    "expected_status": "not_observed"
+  },
+  {
+    "id": "missing_heart_rate_benchmarks",
+    "criteria": [
+      "Does not derive numeric heart rate zones or a threshold from this average heart rate alone.",
+      "Asks for a relevant benchmark or how hard the run felt before prescribing precise targets."
+    ],
+    "as_of": "2026-07-08T12:00:00-05:00",
+    "window_start": "2026-06-10",
+    "scope": "activity_review",
+    "plan_start": "2026-07-06",
+    "plan": "Wednesday: 10 mile long run. Other days easy or rest.",
+    "schedule": {
+      "weeks": [
+        {
+          "week": 1,
+          "days": [
+            {
+              "day_of_week": "Wednesday",
+              "workout_type": "long",
+              "run_miles": 10,
+              "day_is_approximate": false
+            }
+          ]
+        }
+      ]
+    },
+    "activities": [
+      {
+        "id": 104,
+        "name": "Easy run",
+        "sport_type": "Run",
+        "local_date": "2026-07-08",
+        "distance_miles": 4,
+        "average_heartrate": 165
+      }
+    ],
+    "target_activity": {
+      "summary": {
+        "id": 104,
+        "name": "Easy run",
+        "local_date": "2026-07-08",
+        "distance_miles": 4,
+        "average_heartrate": 165
+      },
+      "stream_summary": {}
+    },
+    "expected_status": "partially_completed"
+  },
+  {
+    "id": "weather_comparison",
+    "criteria": [
+      "Recognizes the recorded hot/humid conditions when interpreting slower pace and higher heart rate.",
+      "Does not infer fitness loss from the comparison or invent a numeric pace correction."
+    ],
+    "as_of": "2026-07-08T12:00:00-05:00",
+    "window_start": "2026-06-10",
+    "scope": "activity_review",
+    "plan_start": "2026-07-06",
+    "plan": "Wednesday: 10 mile long run. Other days easy or rest.",
+    "schedule": {
+      "weeks": [
+        {
+          "week": 1,
+          "days": [
+            {
+              "day_of_week": "Wednesday",
+              "workout_type": "long",
+              "run_miles": 10,
+              "day_is_approximate": false
+            }
+          ]
+        }
+      ]
+    },
+    "activities": [
+      {
+        "id": 105,
+        "name": "Cool easy run",
+        "sport_type": "Run",
+        "local_date": "2026-07-01",
+        "distance_miles": 4,
+        "moving_time_seconds": 2400,
+        "average_heartrate": 140,
+        "description": "Cool morning, flat route."
+      },
+      {
+        "id": 106,
+        "name": "Hot easy run",
+        "sport_type": "Run",
+        "local_date": "2026-07-08",
+        "distance_miles": 4,
+        "moving_time_seconds": 2640,
+        "average_heartrate": 155,
+        "description": "Hot and humid, same flat route."
+      }
+    ],
+    "target_activity": {
+      "summary": {
+        "id": 106,
+        "name": "Hot easy run",
+        "local_date": "2026-07-08",
+        "distance_miles": 4,
+        "average_heartrate": 155,
+        "description": "Hot and humid, same flat route."
+      },
+      "stream_summary": {}
+    },
+    "expected_status": "partially_completed"
+  },
+  {
+    "id": "historical_followup",
+    "criteria": [
+      "Explains the July 1 review using its original run/stream data and original plan.",
+      "Explicitly dates any current plan change instead of retroactively changing the old assessment."
+    ],
+    "as_of": "2026-07-08T12:00:00-05:00",
+    "window_start": "2026-06-10",
+    "scope": "training_overview",
+    "plan_start": "2026-07-06",
+    "plan": "Wednesday: 10 mile long run. Other days easy or rest.",
+    "schedule": {
+      "weeks": [
+        {
+          "week": 1,
+          "days": [
+            {
+              "day_of_week": "Wednesday",
+              "workout_type": "long",
+              "run_miles": 10,
+              "day_is_approximate": false
+            }
+          ]
+        }
+      ]
+    },
+    "activities": [
+      {
+        "id": 101,
+        "name": "Wednesday short jog",
+        "sport_type": "Run",
+        "local_date": "2026-07-08",
+        "distance_miles": 1,
+        "moving_time_seconds": 600
+      }
+    ],
+    "question": "Why did you suggest an easier run after my July 1 activity?",
+    "original_context": {
+      "advice_date": "2026-07-01",
+      "generated_at_utc": "2026-07-01 18:00:00",
+      "scope": "activity_review",
+      "activity_id": 107,
+      "snapshot_available": true,
+      "snapshot": {
+        "current_date": "2026-07-01",
+        "advice_request_scope": "activity_review",
+        "target_activity": {
+          "summary": {
+            "id": 107,
+            "name": "July 1 tempo",
+            "local_date": "2026-07-01",
+            "distance_miles": 5
+          },
+          "stream_summary": {
+            "quarters": [
+              {
+                "average_heartrate": 150
+              },
+              {
+                "average_heartrate": 155
+              },
+              {
+                "average_heartrate": 170
+              },
+              {
+                "average_heartrate": 178
+              }
+            ]
+          }
+        },
+        "training_profile": {
+          "plan": "Tempo today, easy tomorrow."
+        },
+        "data_coverage": {
+          "history_completeness": "unverified"
+        }
+      }
+    },
+    "saved_summary": "The July 1 tempo finished harder. Keep the next run easy.",
+    "expected_status": "partially_completed"
+  }
+]

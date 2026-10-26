@@ -140,6 +140,40 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Welcome back" })).toBeInTheDocument();
   });
 
+  it("shows grounded priorities, uncertainty, questions, and data limits", async () => {
+    const advice = {
+      ...storedAdvice(1, TODAY, "Review your activity history first."),
+      body: {
+        ...adviceBody("Review your activity history first."),
+        priority_actions: [{
+          action: "Confirm the missing long run.",
+          evidence: ["data_coverage"],
+          reason: "The July 8 jog was only one mile.",
+          uncertainty: "Another run may not have synced.",
+          adjust_if: "If a run is missing, sync before changing the plan."
+        }],
+        questions: ["Did you record another run on July 8?"],
+        data_sufficiency: "The available records do not establish complete training history."
+      }
+    };
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const path = input.toString();
+      if (path.endsWith("/auth/me")) return jsonResponse({ authenticated: true, username: "runner" });
+      if (path.endsWith("/advice/calendar")) return jsonResponse([{ id: 1, advice_date: TODAY }]);
+      if (path.endsWith(`/advice/day/${TODAY}`)) return jsonResponse({ advice, chat: [] });
+      if (path.endsWith("/advice")) return jsonResponse([advice]);
+      if (path.endsWith("/strava/status")) return jsonResponse({ configured: false, connected: false, scopes: [], queued_jobs: 0, running_jobs: 0, failed_jobs: 0 });
+      return jsonResponse([]);
+    });
+    renderApp();
+    expect(await screen.findByText("Confirm the missing long run.")).toBeInTheDocument();
+    expect(screen.getByText("The July 8 jog was only one mile.")).toBeInTheDocument();
+    expect(screen.getByText(/Another run may not have synced/)).toBeInTheDocument();
+    expect(screen.getByText(/If a run is missing, sync before changing the plan/)).toBeInTheDocument();
+    expect(screen.getByText("Did you record another run on July 8?")).toBeInTheDocument();
+    expect(screen.getByText("The available records do not establish complete training history.")).toBeInTheDocument();
+  });
+
   it("renders dashboard data when authenticated", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
       const path = input.toString();
@@ -461,6 +495,9 @@ describe("App", () => {
     expect(screen.getByText("164 spm")).toBeInTheDocument();
     expect(screen.queryByText("Elevation")).not.toBeInTheDocument();
     expect(screen.queryByText("Visibility")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Advice/ }));
+    expect(screen.getByRole("button", { name: /^Advice/ })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByLabelText("Morning run route map")).not.toBeInTheDocument();
     expect(await screen.findByText("No advice generated for this activity yet.")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /get activity advice/i }));

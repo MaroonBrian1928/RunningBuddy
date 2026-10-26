@@ -5,6 +5,7 @@ services:
       args:
         VITE_MAP_STYLE_URL: "${VITE_MAP_STYLE_URL:-}"
     image: runningbuddy:local
+    restart: unless-stopped
     ports:
       - "${RUNNINGBUDDY_PORT:-7317}:3000"
     # Everything user-configurable comes straight from .env, so adding a new

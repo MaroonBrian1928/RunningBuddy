@@ -50,6 +50,15 @@ export type TrainingAdvice = {
     next_7_days: string[];
     recovery_notes: string;
     confidence: number;
+    priority_actions?: {
+      action: string;
+      evidence: string[];
+      reason: string;
+      uncertainty: string;
+      adjust_if: string;
+    }[];
+    questions?: string[];
+    data_sufficiency?: string;
   };
 };
 
