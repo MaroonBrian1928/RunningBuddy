@@ -195,7 +195,7 @@ async fn gemini_structure_plan(
 /// day-by-day evaluation for a window of recent past days plus the next week.
 /// `activities` are the compact summaries built for the advice payload (they
 /// carry `local_date`). Statuses are computed here so the LLM never has to
-/// decide from timestamps whether a workout was skipped.
+/// infer completion or a missed workout from timestamps alone.
 pub fn evaluate_schedule(
     schedule: &serde_json::Value,
     plan_start_date: &str,
@@ -239,8 +239,20 @@ pub fn evaluate_schedule(
         .zip(&assignments)
         .map(|((date, week_number, day, kind), assigned)| {
             let matched = assigned.map(|index| &candidates[index]);
+            let approximate = day["day_is_approximate"].as_bool().unwrap_or(true);
+            let planned = day["run_miles"].as_f64().filter(|miles| *miles > 0.0);
+            let actual = matched.and_then(|candidate| candidate.distance_miles);
+            let ratio = planned.zip(actual).map(|(planned, actual)| actual / planned);
+            let distance_status = match ratio {
+                Some(ratio) if ratio >= 0.9 => "met",
+                Some(_) => "below_target",
+                None => "unknown",
+            };
             let status = match (*kind, matched.as_ref()) {
                 ("rest", _) => "rest",
+                _ if approximate => "date_unconfirmed",
+                (_, Some(_)) if distance_status == "below_target" => "partially_completed",
+                (_, Some(_)) if *kind != "run" || distance_status == "unknown" => "activity_matched",
                 (_, Some(candidate)) => match (candidate.date - *date).num_days() {
                     0 => "completed",
                     offset if offset < 0 => "completed_early",
@@ -252,7 +264,7 @@ pub fn evaluate_schedule(
                 (_, None) if *date == today - Duration::days(MATCH_DAY_TOLERANCE) => {
                     "pending_makeup"
                 }
-                (_, None) => "missed",
+                (_, None) => "not_observed",
             };
             json!({
                 "date": date.to_string(),
@@ -260,14 +272,20 @@ pub fn evaluate_schedule(
                 "plan_week": week_number,
                 "planned": day,
                 "status": status,
-                "completed_on": matched.map(|candidate| candidate.date.to_string()),
+                "date_is_approximate": approximate,
+                "activity_matched": matched.is_some(),
+                "matched_on": matched.map(|candidate| candidate.date.to_string()),
+                "completed_on": matched.filter(|_| status.starts_with("completed")).map(|candidate| candidate.date.to_string()),
+                "distance_completion": { "status": distance_status, "planned_miles": planned, "actual_miles": actual, "ratio": ratio },
+                "intensity_status": "unknown",
+                "match_basis": "Heuristic: compatible sport within one day; distance met means at least 90% of planned mileage, not verified workout execution.",
                 "matched_activity": matched.map(|candidate| candidate.summary.clone()),
             })
         })
         .collect::<Vec<_>>();
 
     Some(json!({
-        "notes": "Authoritative day-by-day comparison of the structured plan against synced activities, computed by the app. Trust these statuses; do not re-derive them from timestamps. Workouts are matched up to one day early or late: completed_early/completed_late mean the workout was done, just shifted (see completed_on). pending_today = scheduled today and not done yet — never call it skipped. pending_makeup = scheduled yesterday, unmatched, but still completable a day late. Each synced activity satisfies at most one planned workout. Dates outside the last 14 / next 7 days are omitted.",
+        "notes": "Heuristic comparison against available activities. completed/early/late mean a run met at least 90% of planned distance; intensity and workout purpose remain unverified. partially_completed means a candidate run was shorter. activity_matched means execution cannot be assessed. date_unconfirmed means the plan weekday was inferred; no activity is claimed. not_observed is not a confirmed miss: sync coverage may be incomplete. pending_today/pending_makeup are not misses. Each activity matches at most one workout. Dates outside the last 14 / next 7 days are omitted.",
         "days": days,
     }))
 }
@@ -316,6 +334,7 @@ fn activity_candidates(activities: &[serde_json::Value]) -> Vec<Candidate> {
                     .and_then(|value| value.as_f64()),
                 claimed: false,
                 summary: json!({
+                    "id": activity.get("id"),
                     "name": activity.get("name"),
                     "sport_type": sport_type,
                     "local_date": date.to_string(),
@@ -342,7 +361,10 @@ fn assign_activities(
         ("flex", MATCH_DAY_TOLERANCE),
     ] {
         for (entry_index, (date, _, day, kind)) in entries.iter().enumerate() {
-            if *kind != kind_filter || assignments[entry_index].is_some() {
+            if *kind != kind_filter
+                || assignments[entry_index].is_some()
+                || day["day_is_approximate"].as_bool().unwrap_or(true)
+            {
                 continue;
             }
             let target_miles = day.get("run_miles").and_then(|value| value.as_f64());
@@ -419,6 +441,35 @@ mod tests {
                 ]}
             ]
         })
+    }
+
+    #[test]
+    fn short_unknown_and_approximate_matches_do_not_claim_completion() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 4).unwrap();
+        let mut schedule = sample_schedule();
+        schedule["weeks"][0]["days"][0]["run_miles"] = json!(10.0);
+        let mut activity = json!({"id": 42, "name": "Short jog", "sport_type": "Run", "local_date": "2026-07-03", "distance_miles": 1.0});
+        let evaluate = |schedule: &serde_json::Value, activity: &serde_json::Value| {
+            evaluate_schedule(schedule, "2026-06-15", &[activity.clone()], today).unwrap()
+        };
+        let short = evaluate(&schedule, &activity);
+        assert_eq!(short["days"][0]["status"], "partially_completed");
+        assert_eq!(short["days"][0]["distance_completion"]["ratio"], 0.1);
+        assert!(short["days"][0]["completed_on"].is_null());
+        assert_eq!(short["days"][0]["matched_activity"]["id"], 42);
+        activity["distance_miles"] = serde_json::Value::Null;
+        assert_eq!(
+            evaluate(&schedule, &activity)["days"][0]["status"],
+            "activity_matched"
+        );
+        activity["distance_miles"] = json!(9.0);
+        let met = evaluate(&schedule, &activity);
+        assert_eq!(met["days"][0]["status"], "completed");
+        assert_eq!(met["days"][0]["intensity_status"], "unknown");
+        schedule["weeks"][0]["days"][0]["day_is_approximate"] = json!(true);
+        let inferred = evaluate(&schedule, &activity);
+        assert_eq!(inferred["days"][0]["status"], "date_unconfirmed");
+        assert_eq!(inferred["days"][0]["activity_matched"], false);
     }
 
     #[test]
@@ -537,9 +588,9 @@ mod tests {
         let days = evaluation["days"].as_array().unwrap();
         assert_eq!(days[0]["status"], "pending_makeup");
 
-        // Two days later it becomes a real miss.
+        // An elapsed date still cannot prove a miss without complete sync coverage.
         let later = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
         let evaluation = evaluate_schedule(&schedule, "2026-06-29", &[], later).unwrap();
-        assert_eq!(evaluation["days"][0]["status"], "missed");
+        assert_eq!(evaluation["days"][0]["status"], "not_observed");
     }
 }

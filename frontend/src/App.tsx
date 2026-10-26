@@ -395,6 +395,7 @@ function Dashboard({ me, onLogout }: { me: MeResponse; onLogout: () => Promise<v
           onSelect={setSelectedActivityId}
         />
         <ActivityDetailPanel
+          key={selectedActivityId ?? "no-activity"}
           activity={selectedActivity.data}
           advice={selectedActivityId ? advice.data?.find((item) => item.activity_id === selectedActivityId) : undefined}
           generateError={generateAdvice.variables === selectedActivityId ? generateAdvice.error : null}
@@ -783,11 +784,13 @@ function ActivityDetailPanel({
   selectedActivityId: number | null;
   onGenerateAdvice: () => void;
 }) {
+  const [view, setView] = useState<"details" | "advice">("details");
+
   return (
     <section className="panel detailPanel">
       <div className="panelHeader">
         <div><p className="eyebrow">THE DETAILS</p><h2>Activity Detail</h2></div>
-        <button onClick={onGenerateAdvice} disabled={!selectedActivityId || isGenerating || isRecovering}>
+        <button onClick={() => { setView("advice"); onGenerateAdvice(); }} disabled={!selectedActivityId || isGenerating || isRecovering}>
           <AdviceButtonContent
             isGenerating={isGenerating}
             isRecovering={isRecovering}
@@ -795,33 +798,46 @@ function ActivityDetailPanel({
           />
         </button>
       </div>
-      <AdviceRecoveryNotice isRecovering={isRecovering} generateError={generateError} />
-      {isLoading && <p className="muted">Loading activity...</p>}
-      {!selectedActivityId && <div className="emptyState"><span className="emptyStateIcon"><Route size={32} /></span><h3>Every activity has a story.</h3><p>Select an activity to explore your route, pace, and training insights.</p></div>}
       {activity && (
-        <>
-          <dl className="details">
-            <div><dt>Name</dt><dd>{activity.name}</dd></div>
-            <div><dt>Sport</dt><dd>{activity.sport_type ?? "n/a"}</dd></div>
-            <div><dt>Date</dt><dd>{activity.start_date ? format(parseISO(activity.start_date), "MMM d, h:mm a") : "n/a"}</dd></div>
-            <div><dt>Distance</dt><dd>{metersToMiles(activity.distance_meters)} mi</dd></div>
-            <div><dt>Moving time</dt><dd>{secondsToTime(activity.moving_time_seconds)}</dd></div>
-            <div><dt>Elapsed time</dt><dd>{secondsToTime(activity.elapsed_time_seconds)}</dd></div>
-            <div><dt>Pace</dt><dd>{pacePerMile(activity.distance_meters, activity.moving_time_seconds)}</dd></div>
-            <div><dt>Avg heart rate</dt><dd>{formatNumber(activity.average_heartrate)} bpm</dd></div>
-            <div><dt>Max heart rate</dt><dd>{formatNumber(activity.max_heartrate)} bpm</dd></div>
-            <div><dt>Cadence</dt><dd>{formatCadence(activity)}</dd></div>
-            <div><dt>Relative effort</dt><dd>{formatNumber(activity.suffer_score)}</dd></div>
-          </dl>
-          <ActivityMap activity={activity} />
-          <div className="activityAdvice">
-            <h3>Activity Advice</h3>
-            {generateError && isGenerating && <p className="error">{generateError.message}</p>}
-            {!advice && <p className="muted">No advice generated for this activity yet.</p>}
-            {advice && <AdviceCard advice={advice} />}
-          </div>
-        </>
+        <div className="selectedActivityHeading">
+          <strong>{activity.name}</strong>
+          <span>{activity.sport_type ?? "Activity"} · {activity.start_date ? format(parseISO(activity.start_date), "MMM d, h:mm a") : "Date unavailable"}</span>
+        </div>
       )}
+      {selectedActivityId !== null && (
+        <div className="activityViewSwitch" role="group" aria-label="Activity view">
+          <button type="button" aria-pressed={view === "details"} onClick={() => setView("details")}><Route size={16} />Details</button>
+          <button type="button" aria-pressed={view === "advice"} onClick={() => setView("advice")}><Sparkles size={16} />Advice{advice && <span className="savedAdviceDot" aria-label="Saved advice available" />}</button>
+        </div>
+      )}
+      <div className="activityDetailBody" key={view} role="region" aria-label={view === "details" ? "Activity details" : "Activity advice"} tabIndex={0}>
+        <AdviceRecoveryNotice isRecovering={isRecovering} generateError={generateError} />
+        {isLoading && <p className="muted">Loading activity...</p>}
+        {!selectedActivityId && <div className="emptyState"><span className="emptyStateIcon"><Route size={32} /></span><h3>Every activity has a story.</h3><p>Select an activity to explore your route, pace, and training insights.</p></div>}
+        {activity && view === "details" && (
+          <>
+            <dl className="details">
+              <div><dt>Distance</dt><dd>{metersToMiles(activity.distance_meters)} mi</dd></div>
+              <div><dt>Moving time</dt><dd>{secondsToTime(activity.moving_time_seconds)}</dd></div>
+              <div><dt>Elapsed time</dt><dd>{secondsToTime(activity.elapsed_time_seconds)}</dd></div>
+              <div><dt>Pace</dt><dd>{pacePerMile(activity.distance_meters, activity.moving_time_seconds)}</dd></div>
+              <div><dt>Avg heart rate</dt><dd>{formatNumber(activity.average_heartrate)} bpm</dd></div>
+              <div><dt>Max heart rate</dt><dd>{formatNumber(activity.max_heartrate)} bpm</dd></div>
+              <div><dt>Cadence</dt><dd>{formatCadence(activity)}</dd></div>
+              <div><dt>Relative effort</dt><dd>{formatNumber(activity.suffer_score)}</dd></div>
+            </dl>
+            <ActivityMap activity={activity} />
+          </>
+        )}
+        {activity && view === "advice" && (
+            <div className="activityAdvice">
+              <h3>Activity Advice</h3>
+              {generateError && isGenerating && <p className="error">{generateError.message}</p>}
+              {!advice && <p className="muted">No advice generated for this activity yet.</p>}
+              {advice && <AdviceCard advice={advice} />}
+            </div>
+        )}
+      </div>
     </section>
   );
 }
@@ -1185,6 +1201,21 @@ function AdviceCard({ advice }: { advice: TrainingAdvice }) {
         <span className="summaryLabel"><Sparkles size={16} />The big picture</span>
         <p className="coachNote">{advice.body.summary}</p>
       </div>
+      {(advice.body.priority_actions ?? []).length > 0 && (
+        <div className="adviceSection">
+          <strong>Priorities</strong>
+          <ol>
+            {advice.body.priority_actions!.map((item, index) => (
+              <li key={index}>
+                <strong>{item.action}</strong>
+                <p>{item.reason}</p>
+                <p><em>What’s uncertain:</em> {item.uncertainty}</p>
+                <p><em>Adjust if:</em> {item.adjust_if}</p>
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
       {advice.body.load_observations.length > 0 && (
         <div className="adviceSection">
           <strong>What I see</strong>
@@ -1215,6 +1246,18 @@ function AdviceCard({ advice }: { advice: TrainingAdvice }) {
           {advice.body.next_7_days.map((item) => <li key={item}>{item}</li>)}
         </ul>
       </div>
+      {(advice.body.questions ?? []).length > 0 && (
+        <div className="adviceSection">
+          <strong>Questions for you</strong>
+          <ul>{advice.body.questions!.map((question) => <li key={question}>{question}</li>)}</ul>
+        </div>
+      )}
+      {advice.body.data_sufficiency && (
+        <div className="adviceSection">
+          <strong>What this advice is based on</strong>
+          <p>{advice.body.data_sufficiency}</p>
+        </div>
+      )}
       <div className="adviceSection recoverySection">
         <strong>Recovery</strong>
         <p>{advice.body.recovery_notes}</p>

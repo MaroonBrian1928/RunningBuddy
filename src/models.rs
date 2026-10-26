@@ -42,6 +42,15 @@ pub struct ActivityDetail {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AdviceAction {
+    pub action: String,
+    pub evidence: Vec<String>,
+    pub reason: String,
+    pub uncertainty: String,
+    pub adjust_if: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TrainingAdviceBody {
     pub summary: String,
     pub load_observations: Vec<String>,
@@ -52,6 +61,12 @@ pub struct TrainingAdviceBody {
     pub next_7_days: Vec<String>,
     pub recovery_notes: String,
     pub confidence: f64,
+    #[serde(default)]
+    pub priority_actions: Vec<AdviceAction>,
+    #[serde(default)]
+    pub questions: Vec<String>,
+    #[serde(default)]
+    pub data_sufficiency: String,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -69,6 +84,7 @@ pub struct TrainingAdviceRow {
     pub recovery_notes: String,
     pub confidence: f64,
     pub raw_response_json: String,
+    pub request_payload_json: Option<String>,
     pub advice_date: Option<String>,
     pub created_at: String,
 }
@@ -111,6 +127,8 @@ pub struct AdviceDayResponse {
 
 impl TrainingAdviceRow {
     pub fn into_response(self) -> TrainingAdviceResponse {
+        // New fields live in the existing raw response JSON; old rows remain readable.
+        let extra = serde_json::from_str::<TrainingAdviceBody>(&self.raw_response_json).ok();
         TrainingAdviceResponse {
             id: self.id,
             activity_id: self.activity_id,
@@ -126,6 +144,15 @@ impl TrainingAdviceRow {
                 next_7_days: serde_json::from_str(&self.next_7_days_json).unwrap_or_default(),
                 recovery_notes: self.recovery_notes,
                 confidence: self.confidence,
+                priority_actions: extra
+                    .as_ref()
+                    .map(|b| b.priority_actions.clone())
+                    .unwrap_or_default(),
+                questions: extra
+                    .as_ref()
+                    .map(|b| b.questions.clone())
+                    .unwrap_or_default(),
+                data_sufficiency: extra.map(|b| b.data_sufficiency).unwrap_or_default(),
             },
             advice_date: self.advice_date,
             created_at: self.created_at,
