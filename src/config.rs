@@ -19,6 +19,10 @@ pub struct Config {
     pub strava_backfill_days: i64,
     pub llm_provider: String,
     pub llm_model: String,
+    /// OpenAI `reasoning_effort`. Only sent when set: reasoning models reject
+    /// an omitted-vs-null distinction poorly, and non-reasoning models (gpt-4.1,
+    /// gpt-5-chat-latest) reject the parameter outright with a 400.
+    pub llm_reasoning_effort: Option<String>,
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
     pub gemini_api_key: Option<String>,
@@ -49,6 +53,7 @@ impl Config {
             strava_backfill_days: env_or("STRAVA_BACKFILL_DAYS", "180").parse().unwrap_or(180),
             llm_provider: env_or("LLM_PROVIDER", "openai"),
             llm_model: env_or("LLM_MODEL", "gpt-4.1-mini"),
+            llm_reasoning_effort: nonempty_env("LLM_REASONING_EFFORT"),
             openai_api_key: nonempty_env("OPENAI_API_KEY"),
             openai_base_url: env_or("OPENAI_BASE_URL", "https://api.openai.com/v1"),
             gemini_api_key: nonempty_env("GEMINI_API_KEY"),
@@ -58,12 +63,65 @@ impl Config {
             ),
         }
     }
+
+    /// Add `reasoning_effort` to an OpenAI chat payload when configured.
+    /// Left off entirely when unset so non-reasoning models keep working.
+    pub fn apply_reasoning_effort(&self, payload: &mut serde_json::Value) {
+        if let Some(effort) = self.llm_reasoning_effort.as_ref() {
+            payload["reasoning_effort"] = serde_json::Value::String(effort.clone());
+        }
+    }
 }
 
+/// Treats an empty value as unset, matching compose's `${VAR:-default}`
+/// semantics. `env_file:` passes empty entries through literally, so a blank
+/// line in `.env` must fall back to the default rather than become `""`.
 fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
+    nonempty_env(key).unwrap_or_else(|| default.to_string())
 }
 
 fn nonempty_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn config_with_effort(effort: Option<&str>) -> Config {
+        let mut config = Config::from_env();
+        config.llm_reasoning_effort = effort.map(str::to_string);
+        config
+    }
+
+    #[test]
+    fn env_or_treats_blank_values_as_unset() {
+        // env_file: passes `LLM_MODEL=` through as an empty string, which must
+        // not win over the default the way env::var alone would let it.
+        env::set_var("RUNNINGBUDDY_TEST_BLANK", "");
+        assert_eq!(env_or("RUNNINGBUDDY_TEST_BLANK", "fallback"), "fallback");
+
+        env::set_var("RUNNINGBUDDY_TEST_BLANK", "   ");
+        assert_eq!(env_or("RUNNINGBUDDY_TEST_BLANK", "fallback"), "fallback");
+
+        env::set_var("RUNNINGBUDDY_TEST_BLANK", "set");
+        assert_eq!(env_or("RUNNINGBUDDY_TEST_BLANK", "fallback"), "set");
+
+        env::remove_var("RUNNINGBUDDY_TEST_BLANK");
+        assert_eq!(env_or("RUNNINGBUDDY_TEST_BLANK", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn reasoning_effort_is_only_sent_when_configured() {
+        let mut payload = json!({ "model": "gpt-5.6-luna" });
+        config_with_effort(Some("high")).apply_reasoning_effort(&mut payload);
+        assert_eq!(payload["reasoning_effort"], "high");
+
+        // Non-reasoning models 400 on the parameter, so unset must mean absent
+        // rather than null.
+        let mut payload = json!({ "model": "gpt-4.1-mini" });
+        config_with_effort(None).apply_reasoning_effort(&mut payload);
+        assert!(payload.get("reasoning_effort").is_none());
+    }
 }

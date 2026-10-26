@@ -1,5 +1,6 @@
 export type MeResponse = {
   authenticated: boolean;
+  auto_sync_started?: boolean;
   username?: string | null;
   training_plan?: string | null;
   training_goals?: string | null;
@@ -39,11 +40,13 @@ export type TrainingAdvice = {
   provider: string;
   model: string;
   input_window_days: number;
+  advice_date?: string | null;
   created_at: string;
   body: {
     summary: string;
     load_observations: string[];
     risks: string[];
+    last_7_days: string[];
     next_7_days: string[];
     recovery_notes: string;
     confidence: number;
@@ -53,6 +56,22 @@ export type TrainingAdvice = {
 export type AdviceChatMessage = {
   role: "user" | "assistant";
   content: string;
+};
+
+export type AdviceChatTurn = AdviceChatMessage & {
+  id: number;
+  created_at: string;
+};
+
+export type AdviceCalendarEntry = {
+  id: number;
+  advice_date: string | null;
+  created_at: string;
+};
+
+export type AdviceDay = {
+  advice: TrainingAdvice;
+  chat: AdviceChatTurn[];
 };
 
 export type StravaStatus = {
@@ -73,6 +92,13 @@ export type StravaStatus = {
   last_completed_sync_at?: string | null;
 };
 
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: "include",
@@ -85,7 +111,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new Error(body.error ?? `Request failed with ${response.status}`);
+    throw new ApiError(body.error ?? `Request failed with ${response.status}`, response.status);
   }
 
   if (response.status === 204) {
@@ -123,10 +149,12 @@ export const api = {
   activities: () => request<ActivitySummary[]>("/api/activities"),
   activity: (id: number) => request<ActivityDetail>(`/api/activities/${id}`),
   advice: () => request<TrainingAdvice[]>("/api/advice"),
-  chatAdvice: (id: number, messages: AdviceChatMessage[]) =>
-    request<{ message: string }>(`/api/advice/${id}/chat`, {
+  adviceCalendar: () => request<AdviceCalendarEntry[]>("/api/advice/calendar"),
+  adviceDay: (date: string) => request<AdviceDay>(`/api/advice/day/${date}`),
+  chatAdvice: (id: number, message: string) =>
+    request<{ message: string; chat: AdviceChatTurn[] }>(`/api/advice/${id}/chat`, {
       method: "POST",
-      body: JSON.stringify({ messages })
+      body: JSON.stringify({ message })
     }),
   generateAdvice: (input_window_days = 28, activity_id?: number | null) =>
     request<TrainingAdvice>("/api/advice", {

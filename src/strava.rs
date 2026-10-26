@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Redirect},
     Json,
 };
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
@@ -202,6 +203,27 @@ pub async fn bootstrap_env_token(state: &AppState) -> anyhow::Result<bool> {
         Err(err) => return Err(err.into()),
     };
 
+    let env_scopes = state
+        .config
+        .strava_token_scope
+        .clone()
+        .unwrap_or_else(|| "read,activity:read".to_string());
+
+    if let Some(strava_athlete_id) = athlete.get("id").and_then(|value| value.as_i64()) {
+        if let Some(stored) = stored_scopes(state, strava_athlete_id).await? {
+            // A refresh never widens scope, so a narrower env token would pin the
+            // grant to that scope until someone reconnects through OAuth.
+            if !scopes_cover(&env_scopes, &stored) {
+                tracing::warn!(
+                    env_scopes = %env_scopes,
+                    stored_scopes = %stored,
+                    "ignoring env Strava token: narrower than the stored grant"
+                );
+                return Ok(false);
+            }
+        }
+    }
+
     persist_athlete_and_token(
         state,
         athlete,
@@ -211,14 +233,33 @@ pub async fn bootstrap_env_token(state: &AppState) -> anyhow::Result<bool> {
             .config
             .strava_token_expires_at
             .unwrap_or_else(|| chrono::Utc::now().timestamp() + 3600),
-        state
-            .config
-            .strava_token_scope
-            .clone()
-            .unwrap_or_else(|| "read,activity:read".to_string()),
+        env_scopes,
     )
     .await?;
     Ok(true)
+}
+
+async fn stored_scopes(state: &AppState, strava_athlete_id: i64) -> anyhow::Result<Option<String>> {
+    let row = sqlx::query_as::<_, (String,)>(
+        r#"
+        SELECT t.scopes
+        FROM strava_tokens t
+        JOIN athletes a ON a.id = t.athlete_id
+        WHERE a.strava_athlete_id = ?
+        "#,
+    )
+    .bind(strava_athlete_id)
+    .fetch_optional(&state.db)
+    .await?;
+    Ok(row.map(|(scopes,)| scopes))
+}
+
+/// Whether `candidate` grants everything `stored` already grants.
+fn scopes_cover(candidate: &str, stored: &str) -> bool {
+    let candidate = parse_scopes(candidate);
+    parse_scopes(stored)
+        .iter()
+        .all(|scope| candidate.contains(scope))
 }
 
 pub async fn webhook_challenge(
@@ -272,6 +313,52 @@ pub async fn sync_now(State(state): State<AppState>, headers: HeaderMap) -> Resu
         .execute(&state.db)
         .await?;
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Enqueue a background sync the first time a user is seen on a given local
+/// calendar day. Returns whether a job was queued.
+///
+/// The date stamp is claimed with a conditional UPDATE so concurrent requests
+/// (or a browser firing several API calls at once on page load) can only ever
+/// win the race once per day.
+pub async fn maybe_enqueue_daily_sync(state: &AppState, user_id: i64) -> Result<bool> {
+    // Nothing to sync until Strava is connected, and skipping the stamp means
+    // the sync fires as soon as the user does connect.
+    let connected = sqlx::query_as::<_, (i64,)>("SELECT 1 FROM strava_tokens LIMIT 1")
+        .fetch_optional(&state.db)
+        .await?
+        .is_some();
+    if !connected {
+        return Ok(false);
+    }
+
+    let today = Local::now().date_naive().to_string();
+    let claimed = sqlx::query(
+        r#"
+        UPDATE app_users
+        SET last_auto_sync_date = ?
+        WHERE id = ?
+          AND (last_auto_sync_date IS NULL OR last_auto_sync_date < ?)
+        "#,
+    )
+    .bind(&today)
+    .bind(user_id)
+    .bind(&today)
+    .execute(&state.db)
+    .await?
+    .rows_affected()
+        > 0;
+    if !claimed {
+        return Ok(false);
+    }
+
+    sqlx::query("INSERT INTO sync_jobs (job_type, payload_json) VALUES (?, ?)")
+        .bind("daily_sync")
+        .bind(json!({ "backfill_days": state.config.strava_backfill_days }).to_string())
+        .execute(&state.db)
+        .await?;
+    tracing::info!(user_id, date = %today, "queued automatic daily sync");
+    Ok(true)
 }
 
 async fn exchange_code(state: &AppState, code: &str, scopes: String) -> Result<()> {
@@ -427,6 +514,77 @@ fn parse_scopes(scopes: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    async fn test_state(connected: bool) -> AppState {
+        let db = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        sqlx::query("INSERT INTO app_users (id, username, password_hash) VALUES (1, 'a', 'h')")
+            .execute(&db)
+            .await
+            .unwrap();
+        if connected {
+            sqlx::query(
+                "INSERT INTO athletes (id, strava_athlete_id, raw_profile_json) VALUES (1, 99, '{}')",
+            )
+                .execute(&db)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO strava_tokens (athlete_id, access_token, refresh_token, expires_at, scopes)
+                 VALUES (1, 'a', 'r', 0, 'read')",
+            )
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        AppState {
+            config: crate::config::Config::from_env(),
+            db,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    async fn queued_daily_syncs(state: &AppState) -> i64 {
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM sync_jobs WHERE job_type = 'daily_sync'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn daily_sync_is_queued_once_per_day() {
+        let state = test_state(true).await;
+
+        assert!(maybe_enqueue_daily_sync(&state, 1).await.unwrap());
+        assert!(!maybe_enqueue_daily_sync(&state, 1).await.unwrap());
+        assert_eq!(queued_daily_syncs(&state).await, 1);
+
+        // A new local day re-arms the trigger.
+        sqlx::query("UPDATE app_users SET last_auto_sync_date = '2000-01-01' WHERE id = 1")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(maybe_enqueue_daily_sync(&state, 1).await.unwrap());
+        assert_eq!(queued_daily_syncs(&state).await, 2);
+    }
+
+    #[tokio::test]
+    async fn daily_sync_is_skipped_until_strava_is_connected() {
+        let state = test_state(false).await;
+
+        assert!(!maybe_enqueue_daily_sync(&state, 1).await.unwrap());
+        assert_eq!(queued_daily_syncs(&state).await, 0);
+        // No date was stamped, so connecting later still triggers today's sync.
+        let stamp = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT last_auto_sync_date FROM app_users WHERE id = 1",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap()
+        .0;
+        assert!(stamp.is_none());
+    }
+
     #[test]
     fn webhook_event_deserializes_updates() {
         let event: WebhookEvent = serde_json::from_value(json!({
@@ -441,6 +599,19 @@ mod tests {
 
         assert_eq!(event.object_type, "activity");
         assert_eq!(event.updates["title"], "New title");
+    }
+
+    #[tokio::test]
+    async fn env_token_cannot_narrow_the_stored_grant() {
+        // test_state(true) stores athlete 99 with scope `read`.
+        let state = test_state(true).await;
+        assert!(scopes_cover("read,activity:read", "read"));
+        assert!(!scopes_cover("read", "read,activity:read"));
+        assert_eq!(
+            stored_scopes(&state, 99).await.unwrap().as_deref(),
+            Some("read")
+        );
+        assert!(stored_scopes(&state, 1234).await.unwrap().is_none());
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub async fn process_next_job(state: &AppState) -> anyhow::Result<bool> {
 
 async fn process_job(state: &AppState, job: &SyncJob) -> anyhow::Result<()> {
     match job.job_type.as_str() {
-        "manual_sync" => {
+        "manual_sync" | "daily_sync" => {
             let payload: Value =
                 serde_json::from_str(&job.payload_json).unwrap_or_else(|_| json!({}));
             let backfill_days = payload
@@ -204,7 +204,7 @@ async fn load_stored_activity_summary(
 ) -> anyhow::Result<Option<StoredActivitySummary>> {
     Ok(sqlx::query_as::<_, StoredActivitySummary>(
         r#"
-        SELECT name, sport_type, start_date, elapsed_time_seconds, moving_time_seconds,
+        SELECT name, sport_type, start_date, start_date_local, elapsed_time_seconds, moving_time_seconds,
                distance_meters, total_elevation_gain, average_heartrate, average_speed,
                max_speed, average_cadence, average_watts, kilojoules, suffer_score,
                visibility, deleted_at, private_unavailable
@@ -233,6 +233,10 @@ fn stored_activity_matches_list_summary(stored: &StoredActivitySummary, activity
         && optional_string_matches(
             &stored.start_date,
             activity.get("start_date").and_then(Value::as_str),
+        )
+        && optional_string_matches(
+            &stored.start_date_local,
+            activity.get("start_date_local").and_then(Value::as_str),
         )
         && i64_matches(
             stored.elapsed_time_seconds,
@@ -779,6 +783,7 @@ struct StoredActivitySummary {
     name: String,
     sport_type: Option<String>,
     start_date: Option<String>,
+    start_date_local: Option<String>,
     elapsed_time_seconds: Option<i64>,
     moving_time_seconds: Option<i64>,
     distance_meters: Option<f64>,
@@ -841,6 +846,7 @@ mod tests {
             name: "Morning run".to_string(),
             sport_type: Some("Run".to_string()),
             start_date: Some("2026-04-20T12:00:00Z".to_string()),
+            start_date_local: Some("2026-04-20T07:00:00Z".to_string()),
             elapsed_time_seconds: Some(1900),
             moving_time_seconds: Some(1800),
             distance_meters: Some(8046.72),
@@ -861,6 +867,7 @@ mod tests {
             "name": "Morning run",
             "sport_type": "Run",
             "start_date": "2026-04-20T12:00:00Z",
+            "start_date_local": "2026-04-20T07:00:00Z",
             "elapsed_time": 1900,
             "moving_time": 1800,
             "distance": 8046.72,
@@ -882,6 +889,7 @@ mod tests {
             name: "Morning run".to_string(),
             sport_type: Some("Run".to_string()),
             start_date: Some("2026-04-20T12:00:00Z".to_string()),
+            start_date_local: Some("2026-04-20T07:00:00Z".to_string()),
             elapsed_time_seconds: Some(1900),
             moving_time_seconds: Some(1800),
             distance_meters: Some(8046.72),

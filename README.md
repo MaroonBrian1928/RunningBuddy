@@ -31,6 +31,11 @@ which is gitignored and never committed. The runtime SQLite database
 (`runningbuddy.db` / the `./data` bind mount) holds live Strava tokens and
 activity data and is likewise kept out of git.
 
+For HTTPS hosting, set `RUNNINGBUDDY_PUBLIC_URL` to the public HTTPS URL.
+Session cookies then use `Secure` as well as `HttpOnly` and `SameSite=Lax`.
+Sessions expire after 30 days; signing out revokes the session and clears cached
+training data from the UI. Local HTTP development continues to work.
+
 ## Docker
 
 Build and run the combined API/frontend image:

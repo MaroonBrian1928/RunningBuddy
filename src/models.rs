@@ -46,6 +46,9 @@ pub struct TrainingAdviceBody {
     pub summary: String,
     pub load_observations: Vec<String>,
     pub risks: Vec<String>,
+    // Default so advice saved before this field existed still parses.
+    #[serde(default)]
+    pub last_7_days: Vec<String>,
     pub next_7_days: Vec<String>,
     pub recovery_notes: String,
     pub confidence: f64,
@@ -61,10 +64,12 @@ pub struct TrainingAdviceRow {
     pub summary: String,
     pub load_observations_json: String,
     pub risks_json: String,
+    pub last_7_days_json: String,
     pub next_7_days_json: String,
     pub recovery_notes: String,
     pub confidence: f64,
     pub raw_response_json: String,
+    pub advice_date: Option<String>,
     pub created_at: String,
 }
 
@@ -76,7 +81,32 @@ pub struct TrainingAdviceResponse {
     pub model: String,
     pub input_window_days: i64,
     pub body: TrainingAdviceBody,
+    pub advice_date: Option<String>,
     pub created_at: String,
+}
+
+/// One day that has a stored training overview, for the calendar picker.
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdviceCalendarEntry {
+    pub id: i64,
+    pub advice_date: Option<String>,
+    pub created_at: String,
+}
+
+/// A persisted follow-up chat turn attached to a stored overview.
+#[derive(Debug, Serialize, FromRow)]
+pub struct AdviceChatTurn {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// A stored overview plus the follow-up conversation saved with it.
+#[derive(Debug, Serialize)]
+pub struct AdviceDayResponse {
+    pub advice: TrainingAdviceResponse,
+    pub chat: Vec<AdviceChatTurn>,
 }
 
 impl TrainingAdviceRow {
@@ -92,10 +122,12 @@ impl TrainingAdviceRow {
                 load_observations: serde_json::from_str(&self.load_observations_json)
                     .unwrap_or_default(),
                 risks: serde_json::from_str(&self.risks_json).unwrap_or_default(),
+                last_7_days: serde_json::from_str(&self.last_7_days_json).unwrap_or_default(),
                 next_7_days: serde_json::from_str(&self.next_7_days_json).unwrap_or_default(),
                 recovery_notes: self.recovery_notes,
                 confidence: self.confidence,
             },
+            advice_date: self.advice_date,
             created_at: self.created_at,
         }
     }

@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod models;
+pub mod plan;
 pub mod strava;
 pub mod sync;
 
@@ -42,8 +43,13 @@ pub fn app(state: AppState) -> Router {
         .route("/api/activities/{id}", get(activities::detail))
         .route("/api/advice", post(advice::generate))
         .route("/api/advice", get(advice::list))
+        .route("/api/advice/calendar", get(advice::calendar))
+        .route("/api/advice/day/{date}", get(advice::day))
         .route("/api/advice/{id}", get(advice::detail))
-        .route("/api/advice/{id}/chat", post(advice::chat))
+        .route(
+            "/api/advice/{id}/chat",
+            get(advice::chat_history).post(advice::chat),
+        )
         .fallback_service(ServeDir::new("frontend/dist").append_index_html_on_directories(true))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())

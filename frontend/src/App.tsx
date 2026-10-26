@@ -5,35 +5,56 @@ import type { StyleSpecification } from "maplibre-gl";
 import {
   Activity,
   CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   CheckCircle2,
   ClipboardList,
   LogOut,
+  Eye,
+  EyeOff,
+  ArrowRight,
   RefreshCw,
   Save,
   Settings2,
   ShieldCheck,
   Sparkles,
   Target,
+  Footprints,
+  Clock3,
+  Route,
   Unplug,
   XCircle
 } from "lucide-react";
 import {
   Line,
   LineChart,
+  CartesianGrid,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis
 } from "recharts";
-import { format, parseISO } from "date-fns";
+import {
+  addMonths,
+  eachDayOfInterval,
+  endOfMonth,
+  endOfWeek,
+  format,
+  isSameMonth,
+  parseISO,
+  startOfMonth,
+  startOfWeek,
+  subMonths
+} from "date-fns";
 import {
   api,
+  ApiError,
   ActivityDetail,
   ActivitySummary,
   MeResponse,
   StravaStatus,
   TrainingAdvice,
-  type AdviceChatMessage
+  type AdviceChatTurn
 } from "./lib/api";
 
 const CONFIGURED_MAP_STYLE_URL = envValue(import.meta.env.VITE_MAP_STYLE_URL);
@@ -64,6 +85,52 @@ type RouteGeoJson = {
   };
 };
 
+// A generation that reached the LLM is stored server-side even when this client
+// never sees the response (dropped connection, closed laptop). Rather than
+// report a failure the runner would only fix by paying for a second
+// generation, poll the advice list for the row the server is still writing.
+const ADVICE_RECOVERY_TIMEOUT_MS = 120_000;
+const ADVICE_RECOVERY_INTERVAL_MS = 3_000;
+
+type AdviceRecovery = { activityId: number | null };
+
+/// Identity of a stored entry: regenerating today's overview rewrites its row
+/// in place, so the id alone would not show that the server produced something
+/// new. created_at moves on every write.
+function adviceSignature(item: TrainingAdvice) {
+  return `${item.id}:${item.created_at}`;
+}
+
+function isAdviceFor(item: TrainingAdvice, activityId: number | null) {
+  return activityId === null ? item.activity_id == null : item.activity_id === activityId;
+}
+
+async function waitForPersistedAdvice(
+  activityId: number | null,
+  known: Set<string>,
+  token: { cancelled: boolean }
+): Promise<TrainingAdvice[] | null> {
+  const deadline = Date.now() + ADVICE_RECOVERY_TIMEOUT_MS;
+  while (Date.now() < deadline && !token.cancelled) {
+    await new Promise((resolve) => setTimeout(resolve, ADVICE_RECOVERY_INTERVAL_MS));
+    if (token.cancelled) {
+      return null;
+    }
+    try {
+      const list = await api.advice();
+      const landed = list.some(
+        (item) => isAdviceFor(item, activityId) && !known.has(adviceSignature(item))
+      );
+      if (landed) {
+        return list;
+      }
+    } catch {
+      // The API may still be unreachable; keep waiting until the deadline.
+    }
+  }
+  return null;
+}
+
 type SyncWatchState = {
   lastCompletedSyncAt?: string | null;
   failedJobs: number;
@@ -72,24 +139,69 @@ type SyncWatchState = {
 
 export function App() {
   const queryClient = useQueryClient();
+  const [sessionEnded, setSessionEnded] = useState(false);
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me, retry: false });
+  const authenticated = me.data?.authenticated === true;
+  const wasAuthenticated = useRef(false);
+
+  const clearSession = async () => {
+    await queryClient.cancelQueries();
+    queryClient.removeQueries({ predicate: (query) => query.queryKey[0] !== "me" });
+    queryClient.getMutationCache().clear();
+    queryClient.setQueryData<MeResponse>(["me"], { authenticated: false });
+  };
+
+  useEffect(() => {
+    if (!authenticated) return;
+    let ending = false;
+    const onError = (error: unknown) => {
+      if (ending || !(error instanceof ApiError) || error.status !== 401) return;
+      ending = true;
+      setSessionEnded(true);
+      void clearSession();
+    };
+    const queries = queryClient.getQueryCache().subscribe((event) => {
+      if (event.type === "updated" && event.action.type === "error") onError(event.query.state.error);
+    });
+    const mutations = queryClient.getMutationCache().subscribe((event) => {
+      if (event.type === "updated" && event.action.type === "error") onError(event.mutation.state.error);
+    });
+    return () => { queries(); mutations(); };
+  }, [authenticated, queryClient]);
+
+  useEffect(() => {
+    if (wasAuthenticated.current && me.data?.authenticated === false) {
+      setSessionEnded(true);
+      void clearSession();
+    }
+    wasAuthenticated.current = authenticated;
+  }, [authenticated, me.data, queryClient]);
+
+  if (me.isPending) return <Shell><section className="sessionState" role="status"><RefreshCw className="loadingIcon" /><h1>Getting things ready</h1><p className="muted">Checking your session…</p></section></Shell>;
+  if (me.isError) return <Shell><section className="sessionState" role="alert"><ShieldCheck size={32} /><h1>Can’t reach RunningBuddy</h1><p className="muted">Check your connection, then try again.</p><button onClick={() => me.refetch()} disabled={me.isFetching}>{me.isFetching ? "Checking…" : "Try again"}</button></section></Shell>;
+  if (!authenticated) return <Login sessionEnded={sessionEnded} onLogin={() => setSessionEnded(false)} />;
+  return <Dashboard me={me.data} onLogout={async () => { wasAuthenticated.current = false; setSessionEnded(false); await clearSession(); }} />;
+}
+
+function Dashboard({ me, onLogout }: { me: MeResponse; onLogout: () => Promise<void> }) {
+  const queryClient = useQueryClient();
   const [selectedActivityId, setSelectedActivityId] = useState<number | null>(null);
   const [showAthleteConfig, setShowAthleteConfig] = useState(false);
   const [syncWatch, setSyncWatch] = useState<SyncWatchState | null>(null);
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const activities = useQuery({
     queryKey: ["activities"],
     queryFn: api.activities,
-    enabled: me.data?.authenticated === true
+    enabled: me?.authenticated === true
   });
   const advice = useQuery({
     queryKey: ["advice"],
     queryFn: api.advice,
-    enabled: me.data?.authenticated === true
+    enabled: me?.authenticated === true
   });
   const stravaStatus = useQuery({
     queryKey: ["stravaStatus"],
     queryFn: api.stravaStatus,
-    enabled: me.data?.authenticated === true,
+    enabled: me?.authenticated === true,
     refetchInterval: (query) => {
       const status = query.state.data as StravaStatus | undefined;
       return syncWatch || hasActiveSync(status) ? 2000 : false;
@@ -98,21 +210,80 @@ export function App() {
   const selectedActivity = useQuery({
     queryKey: ["activity", selectedActivityId],
     queryFn: () => api.activity(selectedActivityId!),
-    enabled: selectedActivityId !== null
+    enabled: me.authenticated && selectedActivityId !== null
   });
-  const generateAdvice = useMutation({
-    mutationFn: (activityId?: number | null) => api.generateAdvice(28, activityId),
+  const [adviceRecovery, setAdviceRecovery] = useState<AdviceRecovery | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (adviceRecoveryRef.current) adviceRecoveryRef.current.cancelled = true;
+    };
+  }, []);
+  const adviceRecoveryRef = useRef<{ cancelled: boolean } | null>(null);
+  const generateAdvice = useMutation<TrainingAdvice, Error, number | null, { known: Set<string> }>({
+    mutationFn: (activityId: number | null) => api.generateAdvice(28, activityId),
+    onMutate: () => {
+      // A retry supersedes any recovery still polling for the previous attempt.
+      if (adviceRecoveryRef.current) {
+        adviceRecoveryRef.current.cancelled = true;
+        adviceRecoveryRef.current = null;
+      }
+      setAdviceRecovery(null);
+      const current = queryClient.getQueryData<TrainingAdvice[]>(["advice"]) ?? [];
+      return { known: new Set(current.map(adviceSignature)) };
+    },
+    onError: async (_error, activityId, context) => {
+      if (!mounted.current || (_error instanceof ApiError && _error.status === 401)) return;
+      // The request died, but the server keeps going: wait for its row instead
+      // of throwing away a generation that was already paid for.
+      const token = { cancelled: false };
+      adviceRecoveryRef.current = token;
+      setAdviceRecovery({ activityId });
+      const list = await waitForPersistedAdvice(activityId, context?.known ?? new Set(), token);
+      if (token.cancelled) {
+        return;
+      }
+      adviceRecoveryRef.current = null;
+      setAdviceRecovery(null);
+      if (list) {
+        queryClient.setQueryData<TrainingAdvice[]>(["advice"], list);
+        queryClient.invalidateQueries({ queryKey: ["advice-calendar"] });
+        queryClient.invalidateQueries({ queryKey: ["advice-day"] });
+        generateAdvice.reset();
+      }
+    },
     onSuccess: (newAdvice) => {
+      if (!mounted.current) return;
       queryClient.setQueryData<TrainingAdvice[]>(["advice"], (current = []) => [
         newAdvice,
         ...current.filter((item) => item.id !== newAdvice.id)
       ]);
+      // A new overview may add a day to the calendar or replace today's entry.
+      queryClient.invalidateQueries({ queryKey: ["advice-calendar"] });
+      queryClient.invalidateQueries({ queryKey: ["advice-day"] });
     }
   });
   const logout = useMutation({
     mutationFn: api.logout,
-    onSuccess: () => queryClient.invalidateQueries()
+    onSuccess: onLogout
   });
+
+  // The server queues a catch-up sync on the first visit of each day; watch it
+  // the same way we watch a manually triggered sync.
+  const autoSyncWatchedRef = useRef(false);
+  useEffect(() => {
+    if (!me?.auto_sync_started || autoSyncWatchedRef.current) {
+      return;
+    }
+    autoSyncWatchedRef.current = true;
+    setSyncWatch({
+      lastCompletedSyncAt: stravaStatus.data?.last_completed_sync_at,
+      failedJobs: stravaStatus.data?.failed_jobs ?? 0,
+      sawActiveJob: false
+    });
+  }, [me?.auto_sync_started, stravaStatus.data]);
 
   const lastCompletedSyncAtRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
@@ -159,13 +330,13 @@ export function App() {
     queryClient.invalidateQueries({ queryKey: ["stravaStatus"] });
   }, [queryClient, stravaStatus.data, syncWatch]);
 
-  if (me.isLoading) {
-    return <Shell><p className="muted">Loading session...</p></Shell>;
-  }
-
-  if (!me.data?.authenticated) {
-    return <Login />;
-  }
+  const isSyncing = Boolean(syncWatch) || hasActiveSync(stravaStatus.data);
+  const watchSync = () =>
+    setSyncWatch({
+      lastCompletedSyncAt: stravaStatus.data?.last_completed_sync_at,
+      failedJobs: stravaStatus.data?.failed_jobs ?? 0,
+      sawActiveJob: false
+    });
 
   return (
     <Shell
@@ -178,37 +349,45 @@ export function App() {
           >
             <Settings2 size={16} /> Configure Athlete
           </button>
-          <button className="iconButton" onClick={() => logout.mutate()} aria-label="Log out" title="Log out">
+          <span className="signedInUser">{me.username}</span>
+          <button className="iconButton" disabled={logout.isPending} onClick={() => logout.mutate()} aria-label="Log out" title="Log out">
             <LogOut size={18} />
           </button>
         </div>
       }
     >
+      <header className="dashboardHeading">
+        <div><p className="eyebrow">YOUR TRAINING, IN VIEW</p><h1>Every run adds up.</h1><p className="muted">Review your progress and make room for what’s next.</p></div>
+        <div className="dashboardMeta"><span className="dateBadge"><CalendarDays size={16} />{format(new Date(), "EEEE, MMM d")}</span><div className="sectionLinks"><a href="#activities">Activities <ArrowRight size={14} /></a><a href="#training-overview">Training overview <ArrowRight size={14} /></a></div></div>
+      </header>
+      {logout.error && <p className="error notice" role="alert">Couldn’t log out. Check your connection and try again.</p>}
+      {activities.isError && <div className="error notice" role="alert">Couldn’t load activities. <button onClick={() => activities.refetch()}>Try again</button></div>}
+      {/* Collapsed view carries only what gets checked daily: when the last
+          sync landed, and a button to run another. Everything else about the
+          connection lives behind Configure Athlete. */}
+      <SyncBar
+        status={stravaStatus.data}
+        isSyncing={isSyncing}
+        onSyncQueued={watchSync}
+      />
+
       {showAthleteConfig && (
         <section className="configPanel" aria-label="Athlete configuration">
-          <div className="configHeader">
-            <h2>Athlete Configuration</h2>
-            <StravaActions
-              onSyncQueued={() => setSyncWatch({
-                lastCompletedSyncAt: stravaStatus.data?.last_completed_sync_at,
-                failedJobs: stravaStatus.data?.failed_jobs ?? 0,
-                sawActiveJob: false
-              })}
-            />
-          </div>
+          <div className="sectionHeading"><span className="sectionIcon"><Settings2 size={20} /></span><div><p className="eyebrow">MAKE IT YOURS</p><h2>Athlete Configuration</h2></div></div>
           <StravaStatusPanel
             status={stravaStatus.data}
             isLoading={stravaStatus.isLoading}
-            isLive={Boolean(syncWatch) || hasActiveSync(stravaStatus.data)}
+            isLive={isSyncing}
+            actions={<StravaActions isSyncing={isSyncing} onSyncQueued={watchSync} />}
           />
-          <TrainingPlanPanel me={me.data} />
+          <TrainingPlanPanel me={me} />
         </section>
       )}
 
       <DashboardSummary activities={activities.data ?? []} />
       <TrendChart activities={activities.data ?? []} />
 
-      <main className="layout">
+      <main className="layout" id="activities">
         <ActivityTable
           activities={activities.data ?? []}
           isLoading={activities.isLoading}
@@ -218,8 +397,9 @@ export function App() {
         <ActivityDetailPanel
           activity={selectedActivity.data}
           advice={selectedActivityId ? advice.data?.find((item) => item.activity_id === selectedActivityId) : undefined}
-          generateError={generateAdvice.error}
+          generateError={generateAdvice.variables === selectedActivityId ? generateAdvice.error : null}
           isGenerating={generateAdvice.isPending && generateAdvice.variables === selectedActivityId}
+          isRecovering={adviceRecovery?.activityId === selectedActivityId}
           isLoading={selectedActivity.isLoading}
           selectedActivityId={selectedActivityId}
           onGenerateAdvice={() => generateAdvice.mutate(selectedActivityId)}
@@ -227,40 +407,54 @@ export function App() {
       </main>
 
       <AdvicePanel
-        advice={advice.data ?? []}
-        generateError={generateAdvice.error}
+        generateError={generateAdvice.variables == null ? generateAdvice.error : null}
         isGenerating={generateAdvice.isPending && generateAdvice.variables == null}
+        isRecovering={adviceRecovery != null && adviceRecovery.activityId == null}
         onGenerateAdvice={() => generateAdvice.mutate(null)}
       />
     </Shell>
   );
 }
 
-function Login() {
+function Login({ sessionEnded, onLogin }: { sessionEnded: boolean; onLogin: () => void }) {
   const queryClient = useQueryClient();
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const login = useMutation({
-    mutationFn: () => api.login(username, password),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["me"] })
+    mutationFn: () => api.login(username.trim(), password),
+    onSuccess: (data) => { setPassword(""); onLogin(); queryClient.setQueryData(["me"], data); }
   });
 
   return (
     <Shell>
-      <form className="login" onSubmit={(event) => { event.preventDefault(); login.mutate(); }}>
-        <ShieldCheck size={32} />
-        <h1>RunningBuddy</h1>
-        <label>
-          Username
-          <input value={username} onChange={(event) => setUsername(event.target.value)} />
-        </label>
-        <label>
-          Password
-          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
-        </label>
-        {login.error && <p className="error">{login.error.message}</p>}
-        <button type="submit" disabled={login.isPending}>Log in</button>
-      </form>
+      <main className="loginLayout">
+        <section className="loginStory">
+          <span className="eyebrow">A LITTLE PERSPECTIVE. EVERY RUN.</span>
+          <h1>Your miles.<br />Your momentum.</h1>
+          <p>A home for your training, with the bigger picture always in view.</p>
+          <div className="loginFeatures">
+            <div><Activity size={22} /><span><strong>See your progress</strong><small>Your Strava activities, together in one place.</small></span></div>
+            <div><Target size={22} /><span><strong>Stay focused</strong><small>Keep your training plan and goals close.</small></span></div>
+            <div><Sparkles size={22} /><span><strong>Reflect on each run</strong><small>Training insights grounded in your activity.</small></span></div>
+          </div>
+        </section>
+        <form className="login" onSubmit={(event) => { event.preventDefault(); if (!login.isPending && username.trim() && password) login.mutate(); }} aria-labelledby="login-title" aria-busy={login.isPending}>
+          <div className="loginIcon"><ShieldCheck size={26} /></div>
+          <div><h2 id="login-title">Welcome back</h2><p className="muted">Log in to your training space.</p></div>
+          {sessionEnded && <p className="notice" role="status">Your session has ended. Please log in again.</p>}
+          <label htmlFor="username">Username</label>
+          <input id="username" name="username" disabled={login.isPending} autoComplete="username" autoCapitalize="none" spellCheck={false} required value={username} onChange={(event) => { setUsername(event.target.value); login.reset(); }} />
+          <label htmlFor="password">Password</label>
+          <div className="passwordField">
+            <input id="password" name="password" disabled={login.isPending} autoComplete="current-password" type={showPassword ? "text" : "password"} required value={password} aria-describedby={login.error ? "login-error" : undefined} onChange={(event) => { setPassword(event.target.value); login.reset(); }} />
+            <button type="button" className="passwordToggle" aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword} onClick={() => setShowPassword(!showPassword)}>{showPassword ? <EyeOff size={18} /> : <Eye size={18} />}</button>
+          </div>
+          {login.error && <p id="login-error" className="error notice" role="alert">{login.error instanceof ApiError && login.error.status === 401 ? "Incorrect username or password. Try again." : "Couldn’t log in. Check your connection and try again."}</p>}
+          <button className="loginSubmit" type="submit" disabled={login.isPending || !username.trim() || !password}>{login.isPending ? <><span className="buttonSpinner" aria-hidden="true" />Logging in…</> : <>Log in <ArrowRight size={18} /></>}</button>
+          <p className="loginHint">Use your RunningBuddy account to continue.</p>
+        </form>
+      </main>
     </Shell>
   );
 }
@@ -280,19 +474,78 @@ function Shell({ children, action }: { children: React.ReactNode; action?: React
   );
 }
 
-function StravaActions({ onSyncQueued }: { onSyncQueued: () => void }) {
+/// SQLite stamps `CURRENT_TIMESTAMP` in UTC with no zone marker. parseISO reads
+/// a bare "yyyy-MM-dd HH:mm:ss" as local time, which showed every sync hours
+/// off, so pin it to UTC and let the browser render it in the runner's zone.
+function formatServerTime(value: string) {
+  const withT = value.includes("T") ? value : value.replace(" ", "T");
+  const zoned = /([Zz]|[+-]\d{2}:?\d{2})$/.test(withT) ? withT : `${withT}Z`;
+  return format(parseISO(zoned), "MMM d, h:mm a");
+}
+
+/// The collapsed view: when the last sync finished, and one button to run
+/// another. Connection details sit behind Configure Athlete.
+function SyncBar({
+  status,
+  isSyncing,
+  onSyncQueued
+}: {
+  status?: StravaStatus;
+  isSyncing: boolean;
+  onSyncQueued: () => void;
+}) {
+  return (
+    <section className="syncBar" aria-label="Strava sync">
+      <span className="muted">
+        {isSyncing
+          ? "Syncing with Strava..."
+          : status?.last_completed_sync_at
+            ? `Last sync ${formatServerTime(status.last_completed_sync_at)}`
+            : "No completed sync yet"}
+      </span>
+      <SyncButton isSyncing={isSyncing} onSyncQueued={onSyncQueued} />
+    </section>
+  );
+}
+
+function SyncButton({
+  isSyncing,
+  onSyncQueued
+}: {
+  isSyncing: boolean;
+  onSyncQueued: () => void;
+}) {
   const queryClient = useQueryClient();
-  const connect = useMutation({
-    mutationFn: api.stravaConnect,
-    onSuccess: (data) => {
-      window.location.href = data.authorization_url;
-    }
-  });
   const sync = useMutation({
     mutationFn: api.sync,
     onSuccess: () => {
       onSyncQueued();
       queryClient.invalidateQueries({ queryKey: ["stravaStatus"] });
+    }
+  });
+  // Stays disabled for the whole run, not just the queueing request: the work
+  // happens in the background worker afterwards.
+  const busy = sync.isPending || isSyncing;
+
+  return (
+    <button onClick={() => sync.mutate()} disabled={busy}>
+      {busy ? <span className="buttonSpinner" aria-hidden="true" /> : <RefreshCw size={16} />}
+      {busy ? "Syncing..." : "Sync"}
+    </button>
+  );
+}
+
+function StravaActions({
+  isSyncing,
+  onSyncQueued
+}: {
+  isSyncing: boolean;
+  onSyncQueued: () => void;
+}) {
+  const connect = useMutation({
+    mutationFn: api.stravaConnect,
+    onSuccess: (data) => {
+      window.location.href = data.authorization_url;
     }
   });
 
@@ -301,9 +554,7 @@ function StravaActions({ onSyncQueued }: { onSyncQueued: () => void }) {
       <button onClick={() => connect.mutate()} disabled={connect.isPending}>
         <Unplug size={16} /> Connect Strava
       </button>
-      <button onClick={() => sync.mutate()} disabled={sync.isPending}>
-        <RefreshCw size={16} /> Sync
-      </button>
+      <SyncButton isSyncing={isSyncing} onSyncQueued={onSyncQueued} />
     </div>
   );
 }
@@ -311,11 +562,13 @@ function StravaActions({ onSyncQueued }: { onSyncQueued: () => void }) {
 function StravaStatusPanel({
   status,
   isLoading,
-  isLive
+  isLive,
+  actions
 }: {
   status?: StravaStatus;
   isLoading: boolean;
   isLive: boolean;
+  actions?: React.ReactNode;
 }) {
   const athleteName = [status?.athlete?.firstname, status?.athlete?.lastname].filter(Boolean).join(" ");
   const isConnected = status?.connected === true;
@@ -325,7 +578,7 @@ function StravaStatusPanel({
     : isLive
       ? "Watching sync"
       : status?.last_completed_sync_at
-        ? `Last sync ${format(parseISO(status.last_completed_sync_at), "MMM d, h:mm a")}`
+        ? `Last sync ${formatServerTime(status.last_completed_sync_at)}`
         : "No completed sync yet";
 
   return (
@@ -346,6 +599,7 @@ function StravaStatusPanel({
         </span>
         <span>{status ? `${status.queued_jobs} queued / ${status.running_jobs} running / ${status.failed_jobs} failed` : "Queue unavailable"}</span>
       </div>
+      {actions}
     </section>
   );
 }
@@ -422,10 +676,10 @@ function DashboardSummary({ activities }: { activities: ActivitySummary[] }) {
   }, [activities]);
 
   return (
-    <section className="metrics">
+    <section className="metrics" aria-label="All synced activity totals">
       <Metric icon={<Activity size={18} />} label="Activities" value={totals.runs.toString()} />
-      <Metric icon={<CalendarDays size={18} />} label="Miles" value={metersToMiles(totals.distance)} />
-      <Metric icon={<RefreshCw size={18} />} label="Moving Time" value={secondsToTime(totals.time)} />
+      <Metric icon={<Route size={18} />} label="Miles" value={metersToMiles(totals.distance)} />
+      <Metric icon={<Clock3 size={18} />} label="Moving Time" value={secondsToTime(totals.time)} />
     </section>
   );
 }
@@ -439,9 +693,16 @@ function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; 
   );
 }
 
+// Matches Run, TrailRun, VirtualRun, etc. — mirrors is_run_sport in src/advice.rs.
+function isRunSport(sportType?: string | null) {
+  return sportType?.toLowerCase().includes("run") ?? false;
+}
+
 function TrendChart({ activities }: { activities: ActivitySummary[] }) {
   const data = activities
-    .filter((activity) => activity.start_date && activity.distance_meters)
+    .filter(
+      (activity) => activity.start_date && activity.distance_meters && isRunSport(activity.sport_type)
+    )
     .slice()
     .reverse()
     .map((activity) => ({
@@ -450,18 +711,20 @@ function TrendChart({ activities }: { activities: ActivitySummary[] }) {
     }));
 
   return (
-    <section className="panel">
-      <h2>Distance Trend</h2>
-      <div className="chart">
+    <section className="panel trendPanel">
+      <div className="sectionHeading"><span className="sectionIcon"><Activity size={20} /></span><div><h2>Run Distance Trend</h2><p className="sectionSubtitle">Your running distance, one activity at a time.</p></div><span className="chartLegend"><i />Miles per run</span></div>
+      {data.length === 0 && <p className="muted">No synced runs yet.</p>}
+      {data.length > 0 && <div className="chart">
         <ResponsiveContainer>
           <LineChart data={data}>
-            <XAxis dataKey="date" />
-            <YAxis width={42} />
+            <CartesianGrid vertical={false} stroke="#e9efe9" strokeDasharray="3 4" />
+            <XAxis dataKey="date" minTickGap={28} tickLine={false} axisLine={{ stroke: "#d7e2d9" }} />
+            <YAxis width={42} tickLine={false} axisLine={false} />
             <Tooltip />
-            <Line type="monotone" dataKey="miles" stroke="#006d77" strokeWidth={2} dot={false} />
+            <Line type="monotone" dataKey="miles" stroke="#006d77" strokeWidth={2} dot={false} isAnimationActive={false} />
           </LineChart>
         </ResponsiveContainer>
-      </div>
+      </div>}
     </section>
   );
 }
@@ -478,8 +741,8 @@ function ActivityTable({
   onSelect: (id: number) => void;
 }) {
   return (
-    <section className="panel">
-      <h2>Activities</h2>
+    <section className="panel activityListPanel">
+      <div className="sectionHeading"><span className="sectionIcon"><Footprints size={20} /></span><div><h2>Activities</h2><p className="sectionSubtitle">Small steps. A bigger picture.</p></div><span className="countBadge">{activities.length}</span></div>
       {isLoading && <p className="muted">Loading activities...</p>}
       {!isLoading && activities.length === 0 && <p className="muted">No synced activities yet.</p>}
       <div className="table">
@@ -488,10 +751,12 @@ function ActivityTable({
             key={activity.id}
             className={activity.id === selectedId ? "row selected" : "row"}
             onClick={() => onSelect(activity.id)}
+            aria-pressed={activity.id === selectedId}
           >
-            <span>{activity.name}</span>
-            <span>{activity.start_date ? format(parseISO(activity.start_date), "MMM d") : "n/a"}</span>
-            <span>{metersToMiles(activity.distance_meters)} mi</span>
+            <span className="activityRowIcon"><Activity size={18} /></span>
+            <span className="activityRowTitle"><strong>{activity.name}</strong><small>{activity.start_date ? format(parseISO(activity.start_date), "MMM d") : "n/a"}{activity.sport_type ? ` · ${activity.sport_type}` : ""}</small></span>
+            <span className="activityRowDistance">{metersToMiles(activity.distance_meters)} <small>mi</small></span>
+            <ChevronRight size={16} className="rowArrow" />
           </button>
         ))}
       </div>
@@ -504,6 +769,7 @@ function ActivityDetailPanel({
   advice,
   generateError,
   isGenerating,
+  isRecovering,
   isLoading,
   selectedActivityId,
   onGenerateAdvice
@@ -512,6 +778,7 @@ function ActivityDetailPanel({
   advice?: TrainingAdvice;
   generateError: Error | null;
   isGenerating: boolean;
+  isRecovering: boolean;
   isLoading: boolean;
   selectedActivityId: number | null;
   onGenerateAdvice: () => void;
@@ -519,13 +786,18 @@ function ActivityDetailPanel({
   return (
     <section className="panel detailPanel">
       <div className="panelHeader">
-        <h2>Activity Detail</h2>
-        <button onClick={onGenerateAdvice} disabled={!selectedActivityId || isGenerating}>
-          <AdviceButtonContent isGenerating={isGenerating} label="Get Activity Advice" />
+        <div><p className="eyebrow">THE DETAILS</p><h2>Activity Detail</h2></div>
+        <button onClick={onGenerateAdvice} disabled={!selectedActivityId || isGenerating || isRecovering}>
+          <AdviceButtonContent
+            isGenerating={isGenerating}
+            isRecovering={isRecovering}
+            label="Get Activity Advice"
+          />
         </button>
       </div>
+      <AdviceRecoveryNotice isRecovering={isRecovering} generateError={generateError} />
       {isLoading && <p className="muted">Loading activity...</p>}
-      {!selectedActivityId && <p className="muted">Select an activity to inspect streams and raw Strava detail.</p>}
+      {!selectedActivityId && <div className="emptyState"><span className="emptyStateIcon"><Route size={32} /></span><h3>Every activity has a story.</h3><p>Select an activity to explore your route, pace, and training insights.</p></div>}
       {activity && (
         <>
           <dl className="details">
@@ -618,107 +890,301 @@ function ActivityMap({ activity }: { activity: ActivityDetail }) {
   );
 }
 
+const DAY_KEY = "yyyy-MM-dd";
+
+/// Training overviews are kept one-per-day, so the panel is a date browser:
+/// pick a day in the calendar and get that day's overview plus the follow-up
+/// conversation that was saved with it.
 function AdvicePanel({
-  advice,
   generateError,
   isGenerating,
+  isRecovering,
   onGenerateAdvice
 }: {
-  advice: TrainingAdvice[];
   generateError: Error | null;
   isGenerating: boolean;
+  isRecovering: boolean;
   onGenerateAdvice: () => void;
 }) {
-  const latest = advice.find((item) => item.activity_id == null);
-  const currentDateLabel = format(new Date(), "MMM d, yyyy");
+  const queryClient = useQueryClient();
+  const today = format(new Date(), DAY_KEY);
+  const [pickedDate, setPickedDate] = useState<string | null>(null);
+  const [monthCursor, setMonthCursor] = useState<Date | null>(null);
   const [draft, setDraft] = useState("");
-  const [messages, setMessages] = useState<AdviceChatMessage[]>([]);
+
+  const calendar = useQuery({ queryKey: ["advice-calendar"], queryFn: api.adviceCalendar });
+  const storedDates = useMemo(
+    () =>
+      new Set(
+        (calendar.data ?? [])
+          .map((entry) => entry.advice_date)
+          .filter((date): date is string => Boolean(date))
+      ),
+    [calendar.data]
+  );
+
+  // Default to the newest stored day until the runner picks one themselves.
+  const newestStoredDate = calendar.data?.[0]?.advice_date ?? null;
+  const selectedDate = pickedDate ?? newestStoredDate ?? today;
+  const visibleMonth = monthCursor ?? startOfMonth(parseISO(selectedDate));
+  const hasStoredDay = storedDates.has(selectedDate);
+
+  const day = useQuery({
+    queryKey: ["advice-day", selectedDate],
+    queryFn: () => api.adviceDay(selectedDate),
+    enabled: hasStoredDay
+  });
+
   const chat = useMutation({
-    mutationFn: ({ id, nextMessages }: { id: number; nextMessages: AdviceChatMessage[] }) =>
-      api.chatAdvice(id, nextMessages),
+    mutationFn: ({ id, message }: { id: number; message: string }) => api.chatAdvice(id, message),
     onSuccess: (response) => {
-      setMessages((current) => [...current, { role: "assistant", content: response.message }]);
+      queryClient.setQueryData(["advice-day", selectedDate], (current: typeof day.data) =>
+        current ? { ...current, chat: response.chat } : current
+      );
     }
   });
 
   useEffect(() => {
     setDraft("");
-    setMessages([]);
-  }, [latest?.id]);
+    chat.reset();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDate]);
+
+  const advice = day.data?.advice;
+  const messages: AdviceChatTurn[] = day.data?.chat ?? [];
 
   function sendFollowUp(event: React.FormEvent) {
     event.preventDefault();
     const content = draft.trim();
-    if (!latest || !content || chat.isPending) {
+    if (!advice || !content || chat.isPending) {
       return;
     }
-
-    const nextMessages: AdviceChatMessage[] = [...messages, { role: "user", content }];
     setDraft("");
-    setMessages(nextMessages);
-    chat.mutate({ id: latest.id, nextMessages });
+    chat.mutate({ id: advice.id, message: content });
+  }
+
+  function generateForToday() {
+    setPickedDate(today);
+    setMonthCursor(startOfMonth(new Date()));
+    onGenerateAdvice();
   }
 
   return (
-    <section className="panel">
+    <section className="panel overviewPanel" id="training-overview">
       <div className="panelHeader">
         <div>
+          <p className="eyebrow">REFLECT & LOOK AHEAD</p>
           <h2>Training Overview</h2>
-          <p className="muted">{currentDateLabel}</p>
+          <p className="muted">
+            {format(parseISO(selectedDate), "EEEE, MMM d, yyyy")}
+            {selectedDate === today ? " · today" : ""}
+          </p>
         </div>
-        <button onClick={onGenerateAdvice} disabled={isGenerating}>
-          <AdviceButtonContent isGenerating={isGenerating} label="Generate" />
+        <button onClick={generateForToday} disabled={isGenerating || isRecovering}>
+          <AdviceButtonContent
+            isGenerating={isGenerating}
+            isRecovering={isRecovering}
+            label={storedDates.has(today) ? "Regenerate today" : "Generate"}
+          />
         </button>
       </div>
-      {generateError && isGenerating && <p className="error">{generateError.message}</p>}
-      {!latest && <p className="muted">No advice generated yet.</p>}
-      {latest && (
-        <>
-          <AdviceCard advice={latest} />
-          <div className="coachChat">
-            <h3>Follow-up Chat</h3>
-            <div className="chatTranscript">
-              {messages.length === 0 && (
-                <p className="muted">Ask a follow-up about pacing, recovery, schedule changes, or how to adapt the advice.</p>
-              )}
-              {messages.map((message, index) => (
-                <div key={`${message.role}-${index}`} className={`chatBubble ${message.role}`}>
-                  {message.content}
+      <div className="overviewLayout">
+        <aside className="overviewSidebar" aria-label="Saved training overviews">
+          <div className="sidebarHeading"><CalendarDays size={18} /><h3>Your training journal</h3></div>
+          <p className="sectionSubtitle">Choose a saved day to revisit your advice and conversation.</p>
+          <AdviceCalendar
+            visibleMonth={visibleMonth}
+            selectedDate={selectedDate}
+            today={today}
+            storedDates={storedDates}
+            onSelect={setPickedDate}
+            onMonthChange={setMonthCursor}
+          />
+        </aside>
+        <div className="overviewContent">
+          <AdviceRecoveryNotice isRecovering={isRecovering} generateError={generateError} />
+          {day.error && <p className="error">{(day.error as Error).message}</p>}
+          {!hasStoredDay && (
+            <p className="muted">
+              {selectedDate === today
+                ? "No overview saved for today yet. Generate one to start the day's thread."
+                : "No overview was saved for this day."}
+            </p>
+          )}
+          {hasStoredDay && !advice && <p className="muted">Loading this day's overview...</p>}
+          {advice && (
+            <>
+              <AdviceCard advice={advice} />
+              <div className="coachChat">
+                <h3>Follow-up Chat</h3>
+                <div className="chatTranscript">
+                  {messages.length === 0 && !chat.isPending && (
+                    <p className="muted">Ask a follow-up about pacing, recovery, schedule changes, or how to adapt the advice.</p>
+                  )}
+                  {messages.map((message) => (
+                    <div key={message.id} className={`chatBubble ${message.role}`}>
+                      {message.content}
+                    </div>
+                  ))}
+                  {chat.isPending && (
+                    <>
+                      <div className="chatBubble user">{chat.variables?.message}</div>
+                      <div className="chatBubble assistant">Thinking...</div>
+                    </>
+                  )}
                 </div>
-              ))}
-              {chat.isPending && <div className="chatBubble assistant">Thinking...</div>}
-            </div>
-            {chat.error && <p className="error">{(chat.error as Error).message}</p>}
-            <form className="chatForm" onSubmit={sendFollowUp}>
-              <input
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                placeholder="Ask a follow-up..."
-              />
-              <button type="submit" disabled={chat.isPending || draft.trim().length === 0}>
-                Send
-              </button>
-            </form>
-          </div>
-        </>
-      )}
+                {chat.error && <p className="error">{(chat.error as Error).message}</p>}
+                <form className="chatForm" onSubmit={sendFollowUp}>
+                  <input
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    placeholder="Ask a follow-up..."
+                    aria-label="Ask a follow-up"
+                  />
+                  <button type="submit" disabled={chat.isPending || draft.trim().length === 0}>
+                    Send
+                  </button>
+                </form>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
     </section>
   );
 }
 
-function AdviceButtonContent({ isGenerating, label }: { isGenerating: boolean; label: string }) {
+function AdviceCalendar({
+  visibleMonth,
+  selectedDate,
+  today,
+  storedDates,
+  onSelect,
+  onMonthChange
+}: {
+  visibleMonth: Date;
+  selectedDate: string;
+  today: string;
+  storedDates: Set<string>;
+  onSelect: (date: string) => void;
+  onMonthChange: (month: Date) => void;
+}) {
+  const days = useMemo(
+    () =>
+      eachDayOfInterval({
+        start: startOfWeek(startOfMonth(visibleMonth)),
+        end: endOfWeek(endOfMonth(visibleMonth))
+      }),
+    [visibleMonth]
+  );
+
+  return (
+    <div className="adviceCalendar">
+      <div className="calendarHeader">
+        <button
+          type="button"
+          className="calendarNav"
+          aria-label="Previous month"
+          onClick={() => onMonthChange(subMonths(visibleMonth, 1))}
+        >
+          <ChevronLeft size={16} />
+        </button>
+        <strong>{format(visibleMonth, "MMMM yyyy")}</strong>
+        <button
+          type="button"
+          className="calendarNav"
+          aria-label="Next month"
+          onClick={() => onMonthChange(addMonths(visibleMonth, 1))}
+        >
+          <ChevronRight size={16} />
+        </button>
+      </div>
+      <div className="calendarGrid" role="grid">
+        {["S", "M", "T", "W", "T", "F", "S"].map((label, index) => (
+          <span key={`${label}-${index}`} className="calendarWeekday">
+            {label}
+          </span>
+        ))}
+        {days.map((date) => {
+          const key = format(date, DAY_KEY);
+          const stored = storedDates.has(key);
+          const classes = [
+            "calendarDay",
+            stored ? "hasAdvice" : "",
+            key === selectedDate ? "selected" : "",
+            key === today ? "today" : "",
+            isSameMonth(date, visibleMonth) ? "" : "outsideMonth"
+          ]
+            .filter(Boolean)
+            .join(" ");
+          return (
+            <button
+              type="button"
+              key={key}
+              className={classes}
+              aria-pressed={key === selectedDate}
+              aria-label={`${format(date, "MMMM d, yyyy")}${stored ? " (overview saved)" : " (no overview)"}`}
+              disabled={!stored && key !== today}
+              onClick={() => onSelect(key)}
+            >
+              {format(date, "d")}
+            </button>
+          );
+        })}
+      </div>
+      <p className="muted calendarHint">
+        One overview is kept per day. Regenerating today rewrites today's and keeps its chat.
+      </p>
+    </div>
+  );
+}
+
+function AdviceButtonContent({
+  isGenerating,
+  isRecovering = false,
+  label
+}: {
+  isGenerating: boolean;
+  isRecovering?: boolean;
+  label: string;
+}) {
+  const busy = isGenerating || isRecovering;
   return (
     <>
-      {isGenerating ? <span className="buttonSpinner" aria-hidden="true" /> : <Sparkles size={16} />}
-      {isGenerating ? "Generating..." : label}
+      {busy ? <span className="buttonSpinner" aria-hidden="true" /> : <Sparkles size={16} />}
+      {isRecovering ? "Recovering..." : isGenerating ? "Generating..." : label}
     </>
   );
+}
+
+/// While recovering, the request failed but the coach is probably still
+/// working, so the failure is not news yet. Only report it once the recovery
+/// window has closed without a stored result.
+function AdviceRecoveryNotice({
+  isRecovering,
+  generateError
+}: {
+  isRecovering: boolean;
+  generateError: Error | null;
+}) {
+  if (isRecovering) {
+    return (
+      <p className="muted">
+        Lost the connection before the answer arrived. Checking whether the coach finished it
+        anyway...
+      </p>
+    );
+  }
+  return generateError ? <p className="error">{generateError.message}</p> : null;
 }
 
 function AdviceCard({ advice }: { advice: TrainingAdvice }) {
   return (
     <div className="advice">
-      <p className="coachNote">{advice.body.summary}</p>
+      <div className="coachSummary">
+        <span className="summaryLabel"><Sparkles size={16} />The big picture</span>
+        <p className="coachNote">{advice.body.summary}</p>
+      </div>
       {advice.body.load_observations.length > 0 && (
         <div className="adviceSection">
           <strong>What I see</strong>
@@ -728,10 +1194,18 @@ function AdviceCard({ advice }: { advice: TrainingAdvice }) {
         </div>
       )}
       {advice.body.risks.length > 0 && (
-        <div className="adviceSection">
+        <div className="adviceSection cautionSection">
           <strong>Watch-outs</strong>
           <ul>
             {advice.body.risks.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        </div>
+      )}
+      {(advice.body.last_7_days ?? []).length > 0 && (
+        <div className="adviceSection">
+          <strong>Last 7 days</strong>
+          <ul>
+            {advice.body.last_7_days.map((item) => <li key={item}>{item}</li>)}
           </ul>
         </div>
       )}
@@ -741,7 +1215,7 @@ function AdviceCard({ advice }: { advice: TrainingAdvice }) {
           {advice.body.next_7_days.map((item) => <li key={item}>{item}</li>)}
         </ul>
       </div>
-      <div className="adviceSection">
+      <div className="adviceSection recoverySection">
         <strong>Recovery</strong>
         <p>{advice.body.recovery_notes}</p>
       </div>

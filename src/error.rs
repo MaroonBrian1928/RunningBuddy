@@ -9,6 +9,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("not found")]
     NotFound,
+    #[error("{0}")]
+    Upstream(String),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -28,6 +30,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Sqlx(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             AppError::Sqlx(_) | AppError::Reqwest(_) | AppError::Anyhow(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
